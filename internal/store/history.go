@@ -31,9 +31,6 @@ type HistoryRepo interface {
 	// Load 读取最近 n 条历史，返回按时间从旧到新排序的切片。
 	// 若 session 不存在则返回空切片（非错误）。
 	Load(ctx context.Context, sessionID string, n int) ([]*schema.Message, error)
-
-	// Clear 清空指定 session 的历史。主要用于手动运维，业务路径不调用。
-	Clear(ctx context.Context, sessionID string) error
 }
 
 // redisHistoryRepo 是 HistoryRepo 的 Redis 实现。
@@ -124,11 +121,6 @@ func (r *redisHistoryRepo) Load(ctx context.Context, sessionID string, n int) ([
 		})
 	}
 	return msgs, nil
-}
-
-// Clear 实现 HistoryRepo。
-func (r *redisHistoryRepo) Clear(ctx context.Context, sessionID string) error {
-	return r.cli.Del(ctx, r.keyFor(sessionID)).Err()
 }
 
 // keyFor 构造某个 sessionID 对应的 Redis key。

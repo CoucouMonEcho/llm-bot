@@ -16,7 +16,6 @@ package onebot
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -92,8 +91,9 @@ func (a *Adapter) Name() string { return "onebot" }
 // 的错误泵到 logger。
 //
 // ctx 被取消时会触发优雅关闭（等价于调用 Stop）。
+// 当前实现永远返回 nil——监听失败是后台 goroutine 内事件，通过 logger 暴露，
+// 不走返回值。保留 error 返回签名是为了未来做"监听失败同步回传"预留。
 func (a *Adapter) Start(ctx context.Context) error {
-	var startErr error
 	a.startOnce.Do(func() {
 		mux := http.NewServeMux()
 		mux.HandleFunc(a.cfg.WSPath, a.handleWS)
@@ -120,7 +120,7 @@ func (a *Adapter) Start(ctx context.Context) error {
 			_ = a.Stop(context.Background())
 		}()
 	})
-	return startErr
+	return nil
 }
 
 // Stop 优雅关闭服务与所有连接，并关闭 recv channel。幂等。
@@ -274,8 +274,3 @@ func truncate(s string, n int) string {
 	}
 	return s[:n] + "...(truncated)"
 }
-
-// 确保 Adapter 实现 adapter.Adapter；编译期防御。
-// 使用 json.RawMessage 的 _ 赋值只是为了抑制 "imported and not used"
-// 若未来重构掉 json 直接引用可删除该行。
-var _ = json.RawMessage(nil)

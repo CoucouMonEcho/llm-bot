@@ -128,7 +128,6 @@ func decodeAndFilter(raw []byte, selfID int64, tr config.Trigger) (*domain.Inbou
 		UserID:    strconv.FormatInt(ev.UserID, 10),
 		UserName:  userName,
 		Text:      plainText,
-		RawEvent:  &ev,
 	}, nil
 }
 

@@ -50,7 +50,7 @@ llm-bot/
 │   ├── config.yaml                 总配置
 │   └── prompts/default.yaml        人设 / 护栏 / 用户包装模板
 ├── internal/
-│   ├── config/                     viper 加载 + 校验
+│   ├── config/                     YAML 加载 + 校验（少量敏感字段支持 env 覆盖）
 │   ├── domain/                     平台无关消息模型
 │   ├── adapter/
 │   │   ├── adapter.go              Adapter 接口（未来接微信实现此接口）
@@ -84,7 +84,7 @@ llm-bot/
 ```yaml
 llm:
   base_url: "https://api.deepseek.com/v1"
-  api_key:  "sk-xxx"          # 或通过环境变量 OPEN_API_KEY 覆盖
+  api_key:  "sk-xxx"          # 生产环境建议用环境变量 LLMBOT_LLM_API_KEY 覆盖
   model:    "deepseek-chat"
 
 judge:

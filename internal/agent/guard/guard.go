@@ -135,7 +135,6 @@ func (g *guardNode) Invoke(ctx context.Context, in *flow.Input) (*flow.State, er
 	var (
 		mainReply *schema.Message
 		verdict   Verdict = VerdictSafe
-		judgeRaw  string  // 预留给日志，当前未填
 	)
 
 	eg, egCtx := errgroup.WithContext(subCtx)
@@ -189,7 +188,6 @@ func (g *guardNode) Invoke(ctx context.Context, in *flow.Input) (*flow.State, er
 	if verdict == VerdictAttack {
 		st.Blocked = true
 		st.BlockedBy = "judge"
-		st.HitDetail = judgeRaw
 		g.deps.Logger.Info("guard: judge blocked",
 			slog.String("session", in.SessionID))
 		return st, nil

@@ -3,7 +3,7 @@
 // 这一层的设计目标：
 //  1. 让 Adapter（任何 IM 平台）都能把原生协议转换成本层统一模型；
 //  2. 让 Agent 层完全不关心消息来自 QQ、微信还是 Telegram；
-//  3. 字段少而稳定——扩展用 RawEvent（原始事件）承载，而不是在本层不断加字段。
+//  3. 字段少而稳定——扩展用新增类型而非在本层不断加字段。
 package domain
 
 // Platform 标识消息来源平台。将来新增平台只需要增加常量。
@@ -41,9 +41,6 @@ type InboundMessage struct {
 	UserName string
 	// Text 已去除 @、前缀等的纯净文本，也就是喂给 LLM 的那一段。
 	Text string
-	// RawEvent 保留原始事件，便于 Adapter 在 Send 时回查相关字段
-	// （例如 OneBot 的 group_id / user_id 用于 send_msg）。
-	RawEvent any
 }
 
 // OutboundMessage 是 Agent 产出的待发送回复，由 Adapter 翻译成原生协议。
@@ -56,7 +53,4 @@ type OutboundMessage struct {
 	SessionID string
 	// Text 回复内容，纯文本。
 	Text string
-	// ReplyTo 可选：指向待回复的原始消息 id（OneBot 下映射为 message_id）。
-	// Adapter 实现方若支持引用回复则使用该字段。
-	ReplyTo string
 }
