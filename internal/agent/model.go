@@ -41,6 +41,10 @@ func NewChatModel(ctx context.Context, cfg config.LLM) (model.BaseChatModel, err
 		APIKey:     cfg.APIKey,
 		Model:      cfg.Model,
 		HTTPClient: httpClient,
+		// 关闭"思考模式"。
+		ExtraFields: map[string]any{
+			"enable_thinking": false,
+		},
 	})
 	if err != nil {
 		return nil, fmt.Errorf("agent: build openai chat model: %w", err)
