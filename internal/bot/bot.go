@@ -97,14 +97,14 @@ func (b *Bot) handle(parent context.Context, m *domain.InboundMessage) {
 		slog.String("session", m.SessionID),
 		slog.String("user", m.UserID))
 
-	// Step 1：构造 Graph 入参
+	// Step 1: 构造 Graph 入参
 	in := &flow.Input{
 		SessionID: m.SessionID,
 		Query:     m.Text,
 		UserName:  m.UserName,
 	}
 
-	// Step 2：驱动 Graph
+	// Step 2: 驱动 Graph
 	state, err := b.runnable.Invoke(ctx, in)
 	if err != nil {
 		lg.Error("agent invoke failed", slog.Any("err", err))
@@ -115,25 +115,54 @@ func (b *Bot) handle(parent context.Context, m *domain.InboundMessage) {
 		return
 	}
 
-	// Step 3：回发
+	// Step 3: 回发
 	out := &domain.OutboundMessage{
 		Platform:  m.Platform,
 		ConvType:  m.ConvType,
 		SessionID: m.SessionID,
 		Text:      state.Reply.Content,
+		ReplyTo:   decideReplyTarget(m),
 	}
 	if err := b.adapter.Send(ctx, out); err != nil {
 		lg.Error("adapter send failed", slog.Any("err", err))
 		return
 	}
 
-	// Step 4：观测日志——仅在 guard 拦截或 debug 场景有意义
-	if state.Blocked {
+	// Step 4: 观测日志——被拦截的路径走 info 以便线上报警，正常路径降到 debug
+	// 避免刷屏。
+	if state.Verdict.Blocked() {
 		lg.Info("reply sent (blocked path)",
-			slog.String("blocked_by", state.BlockedBy),
-			slog.String("hit_detail", state.HitDetail))
+			slog.String("verdict", state.Verdict.String()),
+			slog.String("detail", state.Verdict.Detail))
 	} else {
 		lg.Debug("reply sent",
 			slog.Int("len", len(state.Reply.Content)))
+	}
+}
+
+// decideReplyTarget 逐条决定本次回复要不要 @、要不要引用、或是什么都不加。
+//
+// 这是 Bot 层"回复样式"唯一的决策入口。之所以写成一个函数而不是挂到
+// 全局 config / Bot 结构上，是因为"样式"天然属于消息级语境——
+//   - "主动发消息、不艾特任何人"       → 返回 nil；
+//   - "某些场景艾特、某些场景不艾特"   → 根据 m 的上下文分支；
+//   - "被攻击的降级回复不引用原消息"   → 未来可再传入 *flow.State 判断。
+//
+// 任何新增策略都应当只改本函数的实现，避免把开关在全局配置里四处蔓延。
+//
+// 当前默认策略（在更细的规则敲定前，先保证行为可用）：
+//   - 私聊：无需指向，返回 nil；
+//   - 群聊且已知发信人：@ 发信人，让群友看清楚是回给谁的；
+//   - 其他不满足条件的情况（比如缺失 UserID）：返回 nil，Adapter 按纯文本发送。
+func decideReplyTarget(m *domain.InboundMessage) *domain.ReplyTarget {
+	if m == nil || m.ConvType != domain.ConversationGroup {
+		return nil
+	}
+	if m.UserID == "" {
+		return nil
+	}
+	return &domain.ReplyTarget{
+		Mode:   domain.ReplyModeAt,
+		UserID: m.UserID,
 	}
 }

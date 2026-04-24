@@ -2,7 +2,7 @@
 //
 // 独立成包的理由：
 //   - agent 顶层会导入 guard 与 nodes 来装配 Graph；
-//   - guard 与 nodes 需要共享 Input / State 定义；
+//   - guard 与 nodes 需要共享 Input / State / Verdict 定义；
 //   - 若把这些类型放在 agent 顶层，guard / nodes 导入 agent 会形成循环；
 //   - 因此提取为一个"叶子包"，agent / guard / nodes 都单向依赖 flow。
 //
@@ -19,8 +19,56 @@ type Input struct {
 	SessionID string
 	// Query 用户的原始文本（已经去掉 @、前缀等触发标记）。
 	Query string
-	// UserName 触发用户的昵称，目前仅作可选 prompt 变量使用。
+	// UserName 触发用户的昵称。当前 Persona.BuildMessages 尚未消费此字段，
+	// 保留以便未来把称呼注入 system prompt 或少样例（Few-shot）时使用。
 	UserName string
+}
+
+// VerdictKind 是一次防护判定的种类。零值 VerdictSafe 代表"未被任何防线拦截"，
+// 这使得 State 零值即等价于"放行"，Graph 的起始节点无需显式初始化。
+type VerdictKind int
+
+const (
+	// VerdictSafe 未被任何防线拦截——正常走主链并落历史。
+	VerdictSafe VerdictKind = iota
+	// VerdictRegex 被第一级同步正则黑名单命中。
+	VerdictRegex
+	// VerdictJudge 被第二级 LLM 裁判判定为攻击。
+	VerdictJudge
+)
+
+// Verdict 是一次防护判定的完整值对象。
+//
+// 为什么不再用 bool + 两个 string：
+//   - 旧 State 里 Blocked/BlockedBy/HitDetail 三字段耦合——任何一处修改都要
+//     同步更新三个字段，缺一个就逻辑不自洽；
+//   - 零值语义模糊："" 到底是"未检测"还是"检测后无命中"？
+//   - Verdict 是值类型（非指针），零值即 Safe，拷贝即隔离，不会出现 nil 判断。
+type Verdict struct {
+	// Kind 判定种类。仅此字段参与分支决策。
+	Kind VerdictKind
+	// Detail 判定的附加信息，仅用于日志：
+	//   - Kind==VerdictRegex 时存命中的正则 pattern 原文；
+	//   - Kind==VerdictJudge 时可选地保留裁判的原始输出；
+	//   - Kind==VerdictSafe 时为空。
+	Detail string
+}
+
+// Blocked 当前判定是否要走降级分支。Graph 的 verdict branch 用它做路由。
+func (v Verdict) Blocked() bool { return v.Kind != VerdictSafe }
+
+// String 返回 Kind 的稳定字符串，便于日志检索。
+func (v Verdict) String() string {
+	switch v.Kind {
+	case VerdictSafe:
+		return "safe"
+	case VerdictRegex:
+		return "regex"
+	case VerdictJudge:
+		return "judge"
+	default:
+		return "unknown"
+	}
 }
 
 // State 是在 Graph 节点间流转的聚合状态。
@@ -34,26 +82,24 @@ type State struct {
 	// In 是入参的只读快照，整个 Graph 生命周期内不应被修改。
 	In *Input
 
+	// History 是 loadHistory 节点从 Redis 拉回的历史消息（旧→新）。
+	// 读取失败时为 nil 切片；downstream 应当视 nil 与空切片等价。
+	History []*schema.Message
+
+	// Messages 是 buildMessages 节点组装好的"system + history + current"消息列表，
+	// 直接交给 guardedModel 节点作为 Generate 的入参。
+	Messages []*schema.Message
+
 	// Reply 是 LLM 的最终回复（可能为降级回复）。
-	// 在 guard 内部主链完成或 fallback 节点生成后填充。
+	// 主链正常返回或 fallback 节点生成后填充。
 	Reply *schema.Message
 
-	// Blocked 标记本条消息是否被判定为攻击并走了降级分支。
-	// - true：guard 节点产出时 Reply 可能为 nil，fallback 节点负责填充；
-	//   同时 saveHistory 应当跳过此条消息与其降级回复。
-	// - false：正常走主链，postproc → saveHistory。
-	Blocked bool
-
-	// BlockedBy 记录判定为攻击的防线来源："regex" / "judge" / ""。
-	// 仅用于日志和可观测性，不参与业务判定。
-	BlockedBy string
-
-	// HitDetail 用于日志：对 regex 存命中的模式字符串，
-	// 对 judge 存裁判模型的原始判定字符串。
-	HitDetail string
+	// Verdict 聚合了"是否拦截"与"为什么拦截"。
+	// 零值即 VerdictSafe，表示一路放行。
+	Verdict Verdict
 }
 
-// NewState 便捷构造器：以 Input 初始化 State，Reply 等字段按零值处理。
+// NewState 便捷构造器：以 Input 初始化 State，其余字段按零值处理。
 func NewState(in *Input) *State {
 	return &State{In: in}
 }

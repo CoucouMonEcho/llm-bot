@@ -247,7 +247,11 @@ func (a *Adapter) readLoop(conn *websocket.Conn, selfID int64) {
 			continue
 		}
 
-		// 投递到 channel；若下游繁忙则打印一条警告并阻塞等待。
+		// 投递到 channel。两段式写入的动机：
+		//  1. 快路径（channel 未满）直接走 case 分支，零日志、零额外开销；
+		//  2. 满时才进入 default 打一条 warn，然后再阻塞写入——这样"反压发生"
+		//     可被 log 系统直接观测，而不是被静默吞掉。
+		// 仅有一次 warn（而不是每帧打）——后续若持续拥塞会在下一次满 channel 时再报。
 		select {
 		case a.recv <- msg:
 		default:
@@ -258,7 +262,16 @@ func (a *Adapter) readLoop(conn *websocket.Conn, selfID int64) {
 	}
 }
 
-// extractBearer 从 "Bearer xxx" 或原样 token 中取出 token 值。
+// extractBearer 从 Authorization 头取出 token 值。
+//
+// 兼容两种形态：
+//   - 标准形态 "Bearer xxx" —— 剥掉前缀后返回 "xxx"；
+//   - 非标准形态（NapCat 某些配置直接把 token 塞到 Authorization）——原样返回。
+//
+// 安全说明：非标准形态意味着任何 Authorization 头值都会被当成候选 token 参与
+// 等值比较。由于上层调用处使用 `token != a.cfg.AccessToken` 做校验且
+// AccessToken 非空时才校验，原样返回不会削弱校验强度；攻击者仍需猜出完整
+// 的 AccessToken 字符串才能通过。
 func extractBearer(h string) string {
 	const prefix = "Bearer "
 	if len(h) > len(prefix) && h[:len(prefix)] == prefix {

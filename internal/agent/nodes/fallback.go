@@ -1,19 +1,19 @@
 // Package nodes 的 fallback.go 是"被 guard 判定为攻击时"的降级回复节点。
 //
-// 位置：guard(Blocked=true) → fallback → END。
+// 位置：guard(Verdict.Blocked) → fallback → END。
 //
 // 实现要点：
 //   - 候选回复池通过配置注入（guard.fallback_replies），代码只负责"随机选一条"；
 //   - 随机化是有意义的：如果降级回复固定，攻击者能从返回串识别出"被拦截了"，
 //     继而迭代绕过。把它做成若干条中随机挑选，降低可识别性；
-//   - 使用 math/rand 足矣——这不是密码学场景，无需 crypto/rand 带来额外开销。
+//   - 直接用标准库 rand：这不是密码学场景，无需 crypto/rand 带来额外开销；
+//     math/rand/v2（Go 1.22+）的顶层函数是并发安全且自动 seed 的，
+//     因此无需手动持有 rng 实例或 mutex。
 package nodes
 
 import (
 	"context"
-	"math/rand"
-	"sync"
-	"time"
+	"math/rand/v2"
 
 	"github.com/cloudwego/eino/compose"
 	"github.com/cloudwego/eino/schema"
@@ -34,16 +34,8 @@ func NewFallback(replies []string) *compose.Lambda {
 	pool := make([]string, len(replies))
 	copy(pool, replies)
 
-	// 每个节点实例持有独立的 rand + mutex，不走全局锁。
-	var mu sync.Mutex
-	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
-
 	return compose.InvokableLambda(func(_ context.Context, st *flow.State) (*flow.State, error) {
-		mu.Lock()
-		idx := rng.Intn(len(pool))
-		mu.Unlock()
-
-		st.Reply = schema.AssistantMessage(pool[idx], nil)
+		st.Reply = schema.AssistantMessage(pool[rand.IntN(len(pool))], nil)
 		return st, nil
 	})
 }

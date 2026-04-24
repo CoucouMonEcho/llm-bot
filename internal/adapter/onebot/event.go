@@ -127,38 +127,36 @@ func decodeAndFilter(raw []byte, selfID int64, tr config.Trigger) (*domain.Inbou
 		SessionID: sessionID,
 		UserID:    strconv.FormatInt(ev.UserID, 10),
 		UserName:  userName,
+		MessageID: strconv.FormatInt(ev.MessageID, 10),
 		Text:      plainText,
 	}, nil
 }
 
 // extractText 从 OneBot 消息字段中提取纯文本并识别 @ 段。
 //
-// OneBot 有两种 message 编码形式：
-//  1. 字符串形式（老协议 / CQ 码）："[CQ:at,qq=123] 你好"
-//  2. 数组形式（新协议 / 默认）：[{"type":"at","data":{"qq":"123"}},{"type":"text","data":{"text":" 你好"}}]
-//
-// NapCat 默认使用数组形式，但容错保留字符串解析路径。
+// 只处理数组形态的 message（NapCat / 现代 go-cqhttp 默认）；字符串形态
+// 直接原样返回、不再尝试识别内嵌的 CQ 码 @ 段——老协议客户端请升级。
+// 这样做的代价是：老客户端在群里 @ 机器人时，atSelf 永远为 false，
+// 只能靠前缀触发群聊，相对可接受。
 //
 // 返回 plainText 与 atSelf（该消息是否 @ 了机器人自己）。
 func extractText(msg json.RawMessage, fallback string, selfID int64) (string, bool, error) {
 	if len(msg) > 0 {
 		trim := strings.TrimSpace(string(msg))
-		// 尝试数组形式
 		if strings.HasPrefix(trim, "[") {
 			var segs []messageSegment
 			if err := json.Unmarshal(msg, &segs); err == nil {
 				return extractFromSegments(segs, selfID)
 			}
-			// 数组形式解析失败则降级到字符串形式
+			// 数组形式解析失败则降级到字符串形态。
 		}
-		// 尝试字符串形式
 		var s string
 		if err := json.Unmarshal(msg, &s); err == nil {
-			return extractFromCQString(s, selfID)
+			return s, false, nil
 		}
 	}
-	// fallback 到 raw_message（字符串，带 CQ 码）
-	return extractFromCQString(fallback, selfID)
+	// message 字段为空或无法解码时退到 raw_message 原文。
+	return fallback, false, nil
 }
 
 // extractFromSegments 遍历数组形式的消息段。
@@ -191,45 +189,6 @@ func extractFromSegments(segs []messageSegment, selfID int64) (string, bool, err
 		default:
 			// 图片、表情、文件等其他段类型忽略：当前项目只处理文本对话。
 		}
-	}
-	return sb.String(), atSelf, nil
-}
-
-// extractFromCQString 处理字符串形式的消息（CQ 码）。
-//
-// 仅识别 [CQ:at,qq=xxx]。其余 CQ 码一律剥除而不报错。
-func extractFromCQString(s string, selfID int64) (string, bool, error) {
-	atSelf := false
-	var sb strings.Builder
-	i := 0
-	for i < len(s) {
-		if s[i] == '[' {
-			end := strings.IndexByte(s[i:], ']')
-			if end < 0 {
-				sb.WriteByte(s[i])
-				i++
-				continue
-			}
-			token := s[i : i+end+1]
-			if strings.HasPrefix(token, "[CQ:at,") {
-				// 解析 qq 参数
-				body := strings.TrimPrefix(token, "[CQ:at,")
-				body = strings.TrimSuffix(body, "]")
-				for _, kv := range strings.Split(body, ",") {
-					if strings.HasPrefix(kv, "qq=") {
-						qq, err := strconv.ParseInt(strings.TrimPrefix(kv, "qq="), 10, 64)
-						if err == nil && qq == selfID {
-							atSelf = true
-						}
-					}
-				}
-			}
-			// 其他 CQ 码一律丢弃
-			i += end + 1
-			continue
-		}
-		sb.WriteByte(s[i])
-		i++
 	}
 	return sb.String(), atSelf, nil
 }
@@ -276,6 +235,10 @@ func toInt64(v any) (int64, error) {
 //
 //	{"action":"send_group_msg","params":{"group_id":123,"message":"hi"}}
 //
+// 群聊场景下若 out.ReplyTo 非空，会把 message 升级为数组形态并在正文前
+// 插入一个 at 段或 reply 段（由 ReplyMode 决定）；否则继续按字符串形态发送。
+// 私聊忽略 ReplyTo——一对一天然无需指向。
+//
 // 我们不处理 echo 字段，也不关心 response：机器人发出去就完事，
 // NapCat 的回执不参与业务流程。
 func buildSendAction(out *domain.OutboundMessage) ([]byte, error) {
@@ -297,16 +260,66 @@ func buildSendAction(out *domain.OutboundMessage) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
+		message, err := buildGroupMessageField(out)
+		if err != nil {
+			return nil, err
+		}
 		return json.Marshal(map[string]any{
 			"action": "send_group_msg",
 			"params": map[string]any{
 				"group_id": groupID,
-				"message":  out.Text,
+				"message":  message,
 			},
 		})
 	default:
 		return nil, fmt.Errorf("onebot: unsupported conv type %q", out.ConvType)
 	}
+}
+
+// buildGroupMessageField 根据 ReplyTo 组装群聊消息字段。
+//
+// 没有 ReplyTo 或 Mode 为 none 时保留原来的字符串形态，减少无谓的字段；
+// 有 at / quote 时升级为 segment 数组：NapCat 对两种形态都兼容，
+// 但只有数组形态能自然携带 at/reply 段。
+func buildGroupMessageField(out *domain.OutboundMessage) (any, error) {
+	if out.ReplyTo == nil || out.ReplyTo.Mode == "" || out.ReplyTo.Mode == domain.ReplyModeNone {
+		return out.Text, nil
+	}
+
+	segs := make([]map[string]any, 0, 3)
+	switch out.ReplyTo.Mode {
+	case domain.ReplyModeAt:
+		if out.ReplyTo.UserID == "" {
+			return nil, fmt.Errorf("onebot: reply mode %q requires user id", out.ReplyTo.Mode)
+		}
+		segs = append(segs,
+			map[string]any{
+				"type": "at",
+				"data": map[string]any{"qq": out.ReplyTo.UserID},
+			},
+			// 在 @ 段与正文之间补一个空格，避免与昵称紧贴。
+			map[string]any{
+				"type": "text",
+				"data": map[string]any{"text": " "},
+			},
+		)
+	case domain.ReplyModeQuote:
+		if out.ReplyTo.MessageID == "" {
+			return nil, fmt.Errorf("onebot: reply mode %q requires message id", out.ReplyTo.Mode)
+		}
+		segs = append(segs, map[string]any{
+			"type": "reply",
+			"data": map[string]any{"id": out.ReplyTo.MessageID},
+		})
+	default:
+		return nil, fmt.Errorf("onebot: unsupported reply mode %q", out.ReplyTo.Mode)
+	}
+
+	segs = append(segs, map[string]any{
+		"type": "text",
+		"data": map[string]any{"text": out.Text},
+	})
+	return segs, nil
 }
 
 // parseSessionIDSuffix 从 "private:123" 形式的 SessionID 中提取数字部分。

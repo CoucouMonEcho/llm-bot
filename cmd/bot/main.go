@@ -33,11 +33,11 @@ import (
 const defaultShutdownTimeout = 10 * time.Second
 
 func main() {
-	// -- Step 1：解析 flag --
+	// Step 1: 解析 flag
 	configPath := flag.String("config", "configs/config.yaml", "path to config yaml")
 	flag.Parse()
 
-	// -- Step 2：加载配置 + logger --
+	// Step 2: 加载配置 + logger
 	cfg, err := config.Load(*configPath)
 	if err != nil {
 		fatal("load config: %v", err)
@@ -48,7 +48,7 @@ func main() {
 		slog.String("model", cfg.LLM.Model),
 		slog.String("judge_model", cfg.Judge.Model))
 
-	// -- Step 3：连 Redis --
+	// Step 3: 连 Redis
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -59,16 +59,13 @@ func main() {
 	defer func() { _ = redisCli.Close() }()
 	historyRepo := store.NewHistoryRepo(redisCli)
 
-	// -- Step 4：加载人设 --
+	// Step 4: 加载人设
 	persona, err := agent.LoadPersona(cfg.Agent.PromptFile)
 	if err != nil {
 		fatal("load persona: %v", err)
 	}
-	logger.Info("persona loaded",
-		slog.String("name", persona.Name),
-		slog.String("system_prompt_hash", persona.SystemPromptHash))
 
-	// -- Step 5：构造 Agent Runnable --
+	// Step 5: 构造 Agent Runnable
 	runnable, err := agent.Build(ctx, cfg, agent.Deps{
 		History: historyRepo,
 		Persona: persona,
@@ -78,17 +75,17 @@ func main() {
 		fatal("build agent: %v", err)
 	}
 
-	// -- Step 6：构造 OneBot Adapter --
+	// Step 6: 构造 OneBot Adapter
 	ad := onebot.New(cfg.Server, cfg.Trigger, logger)
 	if err := ad.Start(ctx); err != nil {
 		fatal("start adapter: %v", err)
 	}
 
-	// -- Step 7：跑主循环 --
+	// Step 7: 跑主循环
 	b := bot.New(ad, runnable, logger)
 	b.Run(ctx) // 阻塞直到 ctx 被取消
 
-	// -- Step 8：优雅关闭 --
+	// Step 8: 优雅关闭
 	logger.Info("shutting down")
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), defaultShutdownTimeout)
 	defer shutdownCancel()

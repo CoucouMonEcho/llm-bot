@@ -13,6 +13,7 @@ package nodes
 
 import (
 	"context"
+	"regexp"
 	"strings"
 
 	"github.com/cloudwego/eino/compose"
@@ -22,6 +23,10 @@ import (
 // maxReplyRunes 是回复文本允许的最大字符数（按 rune 算，兼容中英混排）。
 // 超长会被截断并追加省略号——避免机器人发出过长消息刷屏。
 const maxReplyRunes = 800
+
+// collapseBlankLines 把连续 3 个及以上换行折叠成 2 个。
+// 预编译放包级：避免每次调用 postproc 都重新编译正则。
+var collapseBlankLines = regexp.MustCompile(`\n{3,}`)
 
 // NewPostproc 构造 postproc Lambda 节点。
 func NewPostproc() *compose.Lambda {
@@ -42,20 +47,18 @@ func postproc(_ context.Context, st *flow.State) (*flow.State, error) {
 
 	content := st.Reply.Content
 
-	// Step 1：修剪空白 & 折叠多余空行。
+	// Step 1: 修剪空白 & 折叠多余空行。
 	content = strings.TrimSpace(content)
-	for strings.Contains(content, "\n\n\n") {
-		content = strings.ReplaceAll(content, "\n\n\n", "\n\n")
-	}
+	content = collapseBlankLines.ReplaceAllString(content, "\n\n")
 
-	// Step 2：按 rune 截断以兼容中文。
+	// Step 2: 按 rune 截断以兼容中文。
 	runes := []rune(content)
 	if len(runes) > maxReplyRunes {
 		runes = append(runes[:maxReplyRunes], []rune("……")...)
 		content = string(runes)
 	}
 
-	// Step 3：确保非空。
+	// Step 3: 确保非空。
 	if content == "" {
 		content = "嗯，我一时没组织好语言，换个说法再问我一次？"
 	}

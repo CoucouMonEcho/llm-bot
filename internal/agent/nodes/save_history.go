@@ -29,16 +29,11 @@ import (
 func NewSaveHistory(repo store.HistoryRepo, historyMax int, logger *slog.Logger) *compose.Lambda {
 	lg := logger.With(slog.String("node", "saveHistory"))
 	return compose.InvokableLambda(func(ctx context.Context, st *flow.State) (*flow.State, error) {
-		// 极端 defense：只要被标记 Blocked 绝不写历史。
-		// 理论上 Graph 的 branch 已经保证走不到这里，这是一道额外保险。
-		if st.Blocked {
-			return st, nil
-		}
 		if st.Reply == nil || st.Reply.Content == "" {
 			return st, nil
 		}
 
-		// Step 1：写入用户消息（使用原始 Query，不是 wrapper 后的）。
+		// Step 1: 写入用户消息（使用原始 Query，不是 wrapper 后的）。
 		userMsg := schema.UserMessage(st.In.Query)
 		if err := repo.Append(ctx, st.In.SessionID, userMsg, historyMax); err != nil {
 			lg.Warn("append user message failed",
@@ -47,7 +42,7 @@ func NewSaveHistory(repo store.HistoryRepo, historyMax int, logger *slog.Logger)
 			return st, nil // 不阻断回复发送
 		}
 
-		// Step 2：写入 assistant 回复。
+		// Step 2: 写入 assistant 回复。
 		if err := repo.Append(ctx, st.In.SessionID, st.Reply, historyMax); err != nil {
 			lg.Warn("append assistant message failed",
 				slog.String("session", st.In.SessionID),

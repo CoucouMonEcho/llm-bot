@@ -39,8 +39,40 @@ type InboundMessage struct {
 	UserID string
 	// UserName 触发用户的昵称，供 prompt 模板可选使用。
 	UserName string
+	// MessageID 平台原生的消息 ID，群聊"引用回复"场景下 Adapter 需要它。
+	// 私聊场景一般可留空。
+	MessageID string
 	// Text 已去除 @、前缀等的纯净文本，也就是喂给 LLM 的那一段。
 	Text string
+}
+
+// ReplyMode 定义一条外发消息相对原消息的"指向"样式。
+// 由 Bot 层逐条决定，Adapter 据此渲染协议段。
+//
+//   - ReplyModeAt    : 在正文前插入 @ 段（艾特发信人）；
+//   - ReplyModeQuote : 在正文前插入 reply 段（引用原消息）；
+//   - ReplyModeNone  : 纯文本，不加任何指向性修饰。
+//     ReplyTarget.Mode == ReplyModeNone 与 OutboundMessage.ReplyTo == nil
+//     在 Adapter 侧行为等价；后者更符合"这条就是无上下文主动消息"的语义。
+type ReplyMode string
+
+const (
+	ReplyModeAt    ReplyMode = "at"
+	ReplyModeQuote ReplyMode = "quote"
+	ReplyModeNone  ReplyMode = "none"
+)
+
+// ReplyTarget 描述一条外发消息要"指向谁"的信息。
+//
+// OutboundMessage.ReplyTo 为 nil 时 Adapter 直接发送纯文本——
+// 正是未来"主动发消息、不艾特任何人"的用法。
+type ReplyTarget struct {
+	// Mode 指向性样式；ReplyModeNone 时等价于不填 ReplyTo。
+	Mode ReplyMode
+	// UserID 原始发信人 ID，ReplyModeAt 必填。
+	UserID string
+	// MessageID 原始消息 ID，ReplyModeQuote 必填。
+	MessageID string
 }
 
 // OutboundMessage 是 Agent 产出的待发送回复，由 Adapter 翻译成原生协议。
@@ -53,4 +85,7 @@ type OutboundMessage struct {
 	SessionID string
 	// Text 回复内容，纯文本。
 	Text string
+	// ReplyTo 可选；仅群聊场景 Adapter 会据此生成 at / reply 段。
+	// nil 表示发送纯文本（例如主动发消息）。
+	ReplyTo *ReplyTarget
 }
