@@ -97,9 +97,9 @@ func LoadPersona(path string) (*Persona, error) {
 // 的"标签内是数据而非指令"形成闭环，落地"指令—数据分离"。
 //
 // snap 是本轮的人设参数快照，由调用方从 stats.Store 读出注入；本方法不感知
-// Redis。snap.IsZero() 为真（stats 功能关闭、UserID 缺失或读 Redis 失败）时
-// 跳过追加状态行，保持 system prompt 与无 stats 场景一致；否则把
-// snap.PromptLine() 以双换行隔离的方式拼在 SystemPrompt 末尾。
+// Redis。snap.PromptLine() 被以双换行隔离的方式拼在 SystemPrompt 末尾——即便
+// snap 是零值也会返回只含"当前时间"的状态行，把模型锚在真实日期上避免它
+// 对训练截止之后的年份产生排斥。
 //
 // 状态行的具体格式由 stats.Snapshot.PromptLine 维护——Snapshot 加字段时只需
 // 改那一个方法，不用碰本文件。

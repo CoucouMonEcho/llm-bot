@@ -55,11 +55,14 @@ const (
 
 // Verdict 是一次防护判定的完整值对象。
 //
-// 为什么不再用 bool + 两个 string：
-//   - 旧 State 里 Blocked/BlockedBy/HitDetail 三字段耦合——任何一处修改都要
-//     同步更新三个字段，缺一个就逻辑不自洽；
-//   - 零值语义模糊："" 到底是"未检测"还是"检测后无命中"？
-//   - Verdict 是值类型（非指针），零值即 Safe，拷贝即隔离，不会出现 nil 判断。
+// 把"是否拦截"与"为什么拦截"聚合成一个值类型而不是 bool + 两个 string 的组合：
+//   - Kind 是分支决策的唯一依据，Detail 仅用于日志；二者的耦合集中在一处，
+//     新增一种拦截原因时只需要加一个枚举并填 Detail，不会出现"三字段修改漏一个"
+//     的逻辑不自洽；
+//   - 值类型（非指针）让零值等价于 Safe——State 起始即放行、拷贝即隔离，
+//     调用方不必写任何 nil 判断或显式初始化；
+//   - Detail 的含义由 Kind 决定（见下），避免了"空字符串是未检测还是无命中"
+//     这种模糊。
 type Verdict struct {
 	// Kind 判定种类。仅此字段参与分支决策。
 	Kind VerdictKind
@@ -116,9 +119,8 @@ type State struct {
 
 	// Stats 是本轮对话开始时的人设参数快照（当前含好感度 + 心情，可扩展）。
 	// 由 buildMessages 节点在装配 system prompt 之前填入；若该节点没接到
-	// LoadStatsFunc（stats 功能关闭）则保持零值 Snapshot{}，下游通过
-	// Snapshot.IsZero / PromptLine 统一判断"是否追加状态行"，Graph 其余部分
-	// 对具体字段无感知。
+	// LoadStatsFunc（stats 功能关闭）则保持零值 Snapshot{}，此时 PromptLine
+	// 只渲染当前时间一行，好感度 / 心情段省略。Graph 其余部分对具体字段无感知。
 	Stats stats.Snapshot
 }
 

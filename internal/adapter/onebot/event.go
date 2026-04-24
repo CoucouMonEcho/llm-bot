@@ -86,16 +86,11 @@ func decodeAndFilter(raw []byte, selfID int64, tr config.Trigger) (*domain.Inbou
 		}
 	case "group":
 		// 群聊触发条件：@bot 或 以任一前缀开头（二者任一满足）。
-		matched := false
-		if atSelf {
-			matched = true
-		}
-		plainText, matched = matchPrefix(plainText, tr.Prefix, matched)
-		if tr.GroupAtOnly && !matched {
-			return nil, nil
-		}
-		if !tr.GroupAtOnly && !matched {
-			// 未配置 GroupAtOnly 也没命中前缀/@ 时，默认仍然不触发——
+		var prefixMatched bool
+		plainText, prefixMatched = matchPrefix(plainText, tr.Prefix)
+		matched := atSelf || prefixMatched
+		if !matched {
+			// 无论 GroupAtOnly 是否开启，没命中前缀/@ 时都不触发——
 			// 群内闲聊若全部触发会被洗版。
 			return nil, nil
 		}
@@ -133,10 +128,10 @@ func decodeAndFilter(raw []byte, selfID int64, tr config.Trigger) (*domain.Inbou
 
 // extractText 从 OneBot 消息字段中提取纯文本并识别 @ 段。
 //
-// 只处理数组形态的 message（NapCat / 现代 go-cqhttp 默认）；字符串形态
-// 直接原样返回、不再尝试识别内嵌的 CQ 码 @ 段——老协议客户端请升级。
-// 这样做的代价是：老客户端在群里 @ 机器人时，atSelf 永远为 false，
-// 只能靠前缀触发群聊，相对可接受。
+// 只解析数组形态的 message（NapCat / 现代 go-cqhttp 默认）；字符串形态
+// 原样返回，不识别其中内嵌的 CQ 码 @ 段——避免再维护一套 CQ 码词法分析器。
+// 代价是老协议客户端在群里 @ 机器人时 atSelf 永远为 false，只能靠前缀
+// 触发群聊，相对可接受；老客户端请升级到数组形态。
 //
 // 返回 plainText 与 atSelf（该消息是否 @ 了机器人自己）。
 func extractText(msg json.RawMessage, fallback string, selfID int64) (string, bool, error) {
@@ -193,13 +188,11 @@ func extractFromSegments(segs []messageSegment, selfID int64) (string, bool, err
 }
 
 // matchPrefix 检查 text 是否以 prefixes 中任意一个开头；
-// 若命中，剥掉前缀并把 matched 置为 true。
+// 若命中，剥掉前缀返回 (trimmed, true)；未命中则返回 (text, false)。
 //
-// alreadyMatched 传入的是"之前是否已经因 @ 命中"，用以短路继续检查前缀。
-// 无论是否已经 matched 我们都会尝试剥一次前缀——让 "@bot /help" 这类场景也能
-// 得到剥离后的干净文本。
-func matchPrefix(text string, prefixes []string, alreadyMatched bool) (string, bool) {
-	matched := alreadyMatched
+// 无论调用点之前是否已因 @ 命中都会尝试剥一次前缀——让 "@bot /help" 这类
+// 场景也能得到剥离后的干净文本。
+func matchPrefix(text string, prefixes []string) (string, bool) {
 	trimmed := strings.TrimSpace(text)
 	for _, p := range prefixes {
 		if strings.HasPrefix(trimmed, p) {
@@ -207,19 +200,18 @@ func matchPrefix(text string, prefixes []string, alreadyMatched bool) (string, b
 			return trimmed, true
 		}
 	}
-	return text, matched
+	return text, false
 }
 
 // toInt64 把 any（可能是 json.Number / float64 / string）安全转为 int64。
+// 输入由 json.Unmarshal 填充的 any 字段产生：JSON number 一律是 float64，
+// JSON string 是 string；json.Number 分支仅在未来切到 UseNumber 时才有意义，
+// 现在保留它让那次切换不用再来动这里。
 func toInt64(v any) (int64, error) {
 	switch t := v.(type) {
 	case json.Number:
 		return t.Int64()
 	case float64:
-		return int64(t), nil
-	case int64:
-		return t, nil
-	case int:
 		return int64(t), nil
 	case string:
 		return strconv.ParseInt(t, 10, 64)

@@ -12,7 +12,8 @@
 //     "Messages → Reply"，并发与 cancel 是实现细节，不污染 Graph 拓扑。
 //
 // 本节点的输入已是 state.Messages（buildMessages 组装好的完整消息列表），
-// 产出 state.Reply 或把 state.Verdict 设为 VerdictJudge；不再感知 Persona / History。
+// 产出 state.Reply 或把 state.Verdict 设为 VerdictJudge。Persona / History
+// 的组装在上游节点完成，本节点只消费 Messages——职责边界清晰，方便单测。
 package guard
 
 import (

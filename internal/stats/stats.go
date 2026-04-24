@@ -26,7 +26,6 @@
 //     把积压的衰减结算回来，最多让 persona prompt 里的数字"落后一轮对话"，
 //     这点漂移相对于实现复杂度是划算的。
 //
-// 为此 keyGlobal 里额外存一个 fieldLastChatAt（Unix 秒），记录上次 mood
 // 为此 keyGlobal 里额外存一个 fieldLastChatAt（Unix 秒），记录上次 mood 写入的
 // 时刻；在 applyMood 结算完成后顺带刷新。
 //
@@ -60,6 +59,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"time"
 
@@ -129,11 +129,9 @@ func affinityField(platform, userID string) string {
 // Snapshot 是某个时刻的 stats 只读快照。
 //
 // 作为值类型在包之间流转（flow.State、Persona.BuildMessages 参数等）：
-// 零值同时代表三种"无信号"情形，上游统一按 IsZero / PromptLine 跳过追加
-// 状态行的逻辑：
-//   - stats 功能关闭；
-//   - 冷启动、用户首次对话；
-//   - 读 Redis 失败的 fail-soft 结果。
+// 零值代表三种"无信号"情形——stats 功能关闭、冷启动首次对话、读 Redis 失败
+// 的 fail-soft 结果。IsZero 仅用于让 PromptLine 在这三种情形下省略好感度 /
+// 心情那一段（时间行仍然保留）。
 //
 // 未来加字段只要在本结构体加一行、顺便更新 IsZero / PromptLine 即可，
 // 不会影响到任何签名。
@@ -149,20 +147,26 @@ type Snapshot struct {
 func (s Snapshot) IsZero() bool { return s.Affinity == 0 && s.Mood == 0 }
 
 // PromptLine 把 Snapshot 渲染为一行中文，用于追加到 system prompt 末尾。
-// IsZero 时返回空串——让调用方按"空串=不追加"统一处理。
 //
-// 只渲染数字、不解释取值范围与方向：后者属于长期设定，应由 persona.description
-// 一次性声明；每轮都重复等于烧 token，还会稀释模型对 persona 本体的注意力。
-// 措辞保留"不要说出或暗示这些数字的存在"兜底，防止模型复述数值导致人设崩坏。
+// 总是包含"当前时间"——模型训练数据有截止日期，会对"未来年份"的知识
+// 表现出抗拒或臆断。每轮对话注入一次真实时间把模型锚在当下，避免它把
+// 今天发生的事当成假设。这行字短、位置贴近用户消息，注意力效果足够。
+//
+// 因此本方法始终返回非空串——即便 IsZero（stats 关闭 / 冷启动 / 读失败），
+// 也返回只含时间的那一行，调用方不必特判空字符串。
+// Snapshot 字段只渲染数字、不解释取值范围：
+// 长期语义由 persona.description 一次性声明，每轮重复等于烧 token 稀释注意力。
+// "不要说出或暗示这些数字的存在"兜底，防止模型复述数值导致人设崩坏。
 func (s Snapshot) PromptLine() string {
+	now := time.Now().Format("2006-01-02 15:04 Mon")
 	if s.IsZero() {
-		return ""
+		return fmt.Sprintf("（当前时间：%s）", now)
 	}
 	return fmt.Sprintf(
-		"（当前对该用户的好感度：%d，你的心情：%d。"+
-			"让这些数字影响你的语气、用词长度、是否主动关心，"+
-			"但不要说出或暗示这些数字的存在。）",
-		s.Affinity, s.Mood,
+		"（当前时间：%s。当前对该用户的好感度：%d，你的心情：%d。"+
+			"让这些数字影响你的语气、用词长度，"+
+			"但不要说出或暗示这些数字的存在）",
+		now, s.Affinity, s.Mood,
 	)
 }
 
@@ -294,7 +298,7 @@ func incrHashAndClamp(ctx context.Context, rdb *redis.Client, key, field string,
 // applyMood 结算心情的"懒衰减 + 本轮 delta"并回写 mood / last_chat_at。
 //
 // 流程：
-//  1. pipeline 读取当前 mood 与 last_chat_at，field 缺失当 0 处理；
+//  1. HMGET 读取当前 mood 与 last_chat_at，field 缺失当 0 处理；
 //  2. 按 (now - last_chat_at) / moodRegressionInterval 计算整数衰减步数，
 //     朝 0 方向收敛（regressToZero 保证不越过 0）；
 //  3. 叠加本轮 delta 后 clamp 到 [moodMin, moodMax]；
@@ -304,16 +308,22 @@ func incrHashAndClamp(ctx context.Context, rdb *redis.Client, key, field string,
 // 把 0 当 last 会把"机器人开机到现在"的整段时长都算进衰减，在 Apply 首次触发
 // 瞬间把 mood 拉到 0，吞掉本轮 delta，语义上不对。
 func (s *Store) applyMood(ctx context.Context, delta int, now time.Time) error {
-	readPipe := s.rdb.Pipeline()
-	moodCmd := readPipe.HGet(ctx, keyGlobal, fieldMood)
-	tsCmd := readPipe.HGet(ctx, keyGlobal, fieldLastChatAt)
-	// 两个 HGet 任一 field 不存在都会让 pipeline 返回 redis.Nil，
-	// 视作"冷启动"放行，真错误（网络 / 鉴权 / 类型错乱）才上抛。
-	if _, err := readPipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
+	// 一条 HMGET 取回 mood 与 last_chat_at；field 不存在时对应元素为 nil，
+	// 解析失败一律退化为 0，与 HGet 版 cmd.Int() 的 fail-soft 行为一致。
+	vals, err := s.rdb.HMGet(ctx, keyGlobal, fieldMood, fieldLastChatAt).Result()
+	if err != nil && !errors.Is(err, redis.Nil) {
 		return fmt.Errorf("read mood+ts: %w", err)
 	}
-	cur, _ := moodCmd.Int()
-	lastUnix, _ := tsCmd.Int64()
+	var cur int
+	var lastUnix int64
+	if len(vals) == 2 {
+		if s, ok := vals[0].(string); ok {
+			cur, _ = strconv.Atoi(s)
+		}
+		if s, ok := vals[1].(string); ok {
+			lastUnix, _ = strconv.ParseInt(s, 10, 64)
+		}
+	}
 
 	regressed := cur
 	if lastUnix > 0 {
@@ -336,17 +346,15 @@ func (s *Store) applyMood(ctx context.Context, delta int, now time.Time) error {
 
 // regressToZero 将 v 朝 0 方向收敛 steps 步，但不越过 0。steps 必须非负。
 //
-// 单表达式推导（int 版 sign/abs 技巧）：
-//
-//	sign(v) = min(max(v, -1), 1)   // 取值域 {-1, 0, 1}
-//	abs(v)  = max(v, -v)
-//	result  = v - sign(v) * min(abs(v), steps)
-//
-// v=0 时 sign=0，乘积项为 0，结果就是 v；min(abs(v), steps) 保证步长不会越过
-// |v|，所以不会穿过 0 轴。代价是密度偏高，读的时候要在脑子里把 sign/abs 代
-// 回去；换来的好处是无分支、纯算术，贴合"懒结算"语境下的 micro 取舍。
+// 正数向下减、负数向上加；两端都在 0 处截停。
 func regressToZero(v, steps int) int {
-	return v - min(max(v, -1), 1)*min(max(v, -v), steps)
+	if v > 0 {
+		return max(0, v-steps)
+	}
+	if v < 0 {
+		return min(0, v+steps)
+	}
+	return 0
 }
 
 // scoreSystemPrompt 是打分模型的 system message。

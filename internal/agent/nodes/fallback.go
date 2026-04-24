@@ -30,12 +30,9 @@ func NewFallback(replies []string) *compose.Lambda {
 		panic("agent/nodes: fallback replies must not be empty")
 	}
 
-	// 拷贝一份只读池，避免外部修改切片导致并发问题。
-	pool := make([]string, len(replies))
-	copy(pool, replies)
-
+	// replies 源自配置，启动后不再改动；字符串不可变，直接引用即可。
 	return compose.InvokableLambda(func(_ context.Context, st *flow.State) (*flow.State, error) {
-		st.Reply = schema.AssistantMessage(pool[rand.IntN(len(pool))], nil)
+		st.Reply = schema.AssistantMessage(replies[rand.IntN(len(replies))], nil)
 		return st, nil
 	})
 }
