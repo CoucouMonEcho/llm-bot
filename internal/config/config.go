@@ -28,6 +28,17 @@ type Config struct {
 	Guard   Guard   `yaml:"guard"`
 	Trigger Trigger `yaml:"trigger"`
 	Log     Log     `yaml:"log"`
+	Stats   Stats   `yaml:"stats"`
+}
+
+// Stats 控制"人设参数"功能（当前含好感度 + 心情，可扩展为疲劳度、信任度等
+// 影响回复风格的参数）。
+//
+// Enabled=false 时，bot 不调打分模型、agent 不读 Redis stats key，system
+// prompt 中也不会出现状态行。Enabled=true 时复用 cfg.Judge 的 LLM 作为打分
+// 模型，不额外引入新的 LLM 配置段。
+type Stats struct {
+	Enabled bool `yaml:"enabled"`
 }
 
 // Server 描述对外提供的 HTTP / WebSocket 服务。

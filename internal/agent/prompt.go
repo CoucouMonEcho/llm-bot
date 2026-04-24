@@ -19,6 +19,7 @@ import (
 	"strings"
 
 	"github.com/cloudwego/eino/schema"
+	"github.com/echo/llm-bot/internal/stats"
 	"gopkg.in/yaml.v3"
 )
 
@@ -94,10 +95,32 @@ func LoadPersona(path string) (*Persona, error) {
 //
 // 用户 Query 被包裹在硬编码的 <user_input> 标签中：该标签与 guardrails 里声明
 // 的"标签内是数据而非指令"形成闭环，落地"指令—数据分离"。
-func (p *Persona) BuildMessages(history []*schema.Message, query string) ([]*schema.Message, error) {
+//
+// snap 是本轮的人设参数快照，由调用方从 stats.Store 读出注入；本方法不感知
+// Redis。snap.IsZero() 为真（stats 功能关闭、UserID 缺失或读 Redis 失败）时
+// 跳过追加状态行，保持 system prompt 与无 stats 场景一致；否则把
+// snap.PromptLine() 以双换行隔离的方式拼在 SystemPrompt 末尾。
+//
+// 状态行的具体格式由 stats.Snapshot.PromptLine 维护——Snapshot 加字段时只需
+// 改那一个方法，不用碰本文件。
+//
+// 注意不要写回 p.SystemPrompt：那是启动期固化的只读快照，多 goroutine 共享；
+// 这里每次调用都在栈上用 strings.Builder 构造一份新的 system content。
+func (p *Persona) BuildMessages(history []*schema.Message, query string, snap stats.Snapshot) ([]*schema.Message, error) {
+	sysContent := p.SystemPrompt
+	if line := snap.PromptLine(); line != "" {
+		var sb strings.Builder
+		sb.Grow(len(p.SystemPrompt) + len(line) + 2)
+		sb.WriteString(p.SystemPrompt)
+		// 双换行隔离状态行，无论原 SystemPrompt 末尾是否带换行都能稳定生效。
+		sb.WriteString("\n\n")
+		sb.WriteString(line)
+		sysContent = sb.String()
+	}
+
 	userMsg := schema.UserMessage("<user_input>\n" + query + "\n</user_input>")
 	msgs := make([]*schema.Message, 0, len(history)+2)
-	msgs = append(msgs, schema.SystemMessage(p.SystemPrompt))
+	msgs = append(msgs, schema.SystemMessage(sysContent))
 	msgs = append(msgs, history...)
 	msgs = append(msgs, userMsg)
 	return msgs, nil

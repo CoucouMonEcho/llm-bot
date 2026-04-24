@@ -11,10 +11,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cloudwego/eino/components/model"
 	"github.com/echo/llm-bot/internal/adapter"
 	"github.com/echo/llm-bot/internal/agent"
 	"github.com/echo/llm-bot/internal/agent/flow"
 	"github.com/echo/llm-bot/internal/domain"
+	"github.com/echo/llm-bot/internal/stats"
 )
 
 // maxConcurrent 单进程同时处理的最大消息数。
@@ -31,18 +33,30 @@ type Bot struct {
 	runnable agent.Runnable
 	logger   *slog.Logger
 
+	// statsStore 为 nil 表示 stats 功能关闭；handle 中必须先判空再使用。
+	statsStore *stats.Store
+	// scoreModel 用于 stats.Dispatch 的异步打分；statsStore 非 nil 时应非 nil，
+	// 但为了防御性编程（例如运维在 main 里改出了不一致的组合），handle 中
+	// 两个字段都要判空，缺任一项就整体跳过参数更新，而不是 panic。
+	scoreModel model.BaseChatModel
+
 	sem chan struct{} // 并发信号量
 }
 
 // New 构造一个 Bot。
 //
 // ad 可以是任何满足 adapter.Adapter 的实现；rn 是 agent.Build 的返回值。
-func New(ad adapter.Adapter, rn agent.Runnable, logger *slog.Logger) *Bot {
+// statsStore / scoreModel 可以同时为 nil，表示关闭 stats 功能；同时非 nil 则开启。
+// 不在 New 里校验"一开一关"的半开状态——这类配置一致性由 main 层负责保障，
+// Bot 只做防御性判空即可。
+func New(ad adapter.Adapter, rn agent.Runnable, statsStore *stats.Store, scoreModel model.BaseChatModel, logger *slog.Logger) *Bot {
 	return &Bot{
-		adapter:  ad,
-		runnable: rn,
-		logger:   logger.With(slog.String("component", "bot")),
-		sem:      make(chan struct{}, maxConcurrent),
+		adapter:    ad,
+		runnable:   rn,
+		logger:     logger.With(slog.String("component", "bot")),
+		statsStore: statsStore,
+		scoreModel: scoreModel,
+		sem:        make(chan struct{}, maxConcurrent),
 	}
 }
 
@@ -98,8 +112,11 @@ func (b *Bot) handle(parent context.Context, m *domain.InboundMessage) {
 		slog.String("user", m.UserID))
 
 	// Step 1: 构造 Graph 入参
+	// UserID 透传给 Graph：stats 按人头维度读写（好感度按 UserID 分 key），
+	// 群聊里一个 SessionID 对应多个 UserID，不能用 SessionID 顶替。
 	in := &flow.Input{
 		SessionID: m.SessionID,
+		UserID:    m.UserID,
 		Query:     m.Text,
 		UserName:  m.UserName,
 	}
@@ -137,6 +154,17 @@ func (b *Bot) handle(parent context.Context, m *domain.InboundMessage) {
 	} else {
 		lg.Debug("reply sent",
 			slog.Int("len", len(state.Reply.Content)))
+	}
+
+	// Step 5: 异步 stats 打分。放在 Send 之后触发，保证主回复路径不承担
+	// 打分延迟；Dispatch 内部用独立 ctx，不受本函数 ctx 到期影响。
+	//
+	// 即便 state.Verdict.Blocked() 为真（挨了攻击走 fallback 回复）也照样
+	// 打分——用户骂人本来就该扣机器人心情，不跳过是为了让
+	// "挨骂→心情变差→后续回复更烦躁" 的反馈闭环成立。
+	if b.statsStore != nil && b.scoreModel != nil && m.UserID != "" {
+		stats.Dispatch(b.statsStore, b.scoreModel, b.logger,
+			m.UserID, m.Text, state.Reply.Content)
 	}
 }
 

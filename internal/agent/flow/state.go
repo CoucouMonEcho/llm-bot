@@ -9,7 +9,10 @@
 // 本包仅保存**类型定义**，不放任何业务逻辑。
 package flow
 
-import "github.com/cloudwego/eino/schema"
+import (
+	"github.com/cloudwego/eino/schema"
+	"github.com/echo/llm-bot/internal/stats"
+)
 
 // Input 是从 Bot 主循环喂进 Graph 的入参。
 // 字段设计刻意精简——平台相关字段留在 domain.InboundMessage 里，
@@ -17,6 +20,13 @@ import "github.com/cloudwego/eino/schema"
 type Input struct {
 	// SessionID 对话的唯一标识，用于 Redis key 和日志。
 	SessionID string
+	// UserID 触发本次消息的用户 ID。
+	// stats 中"按人头维度"的参数（好感度、未来的信任度等）都按 UserID 读写
+	// 而不是按 SessionID：群聊里一个 SessionID 对应多个 UserID，这些参数
+	// 必须跟到人头上才有意义。
+	// 私聊虽然一个 session 就一个用户，但调用方统一填充、下游不分流程，
+	// 这里对两种会话类型一视同仁都要求填 UserID。
+	UserID string
 	// Query 用户的原始文本（已经去掉 @、前缀等触发标记）。
 	Query string
 	// UserName 触发用户的昵称。当前 Persona.BuildMessages 尚未消费此字段，
@@ -97,6 +107,13 @@ type State struct {
 	// Verdict 聚合了"是否拦截"与"为什么拦截"。
 	// 零值即 VerdictSafe，表示一路放行。
 	Verdict Verdict
+
+	// Stats 是本轮对话开始时的人设参数快照（当前含好感度 + 心情，可扩展）。
+	// 由 buildMessages 节点在装配 system prompt 之前填入；若该节点没接到
+	// LoadStatsFunc（stats 功能关闭）则保持零值 Snapshot{}，下游通过
+	// Snapshot.IsZero / PromptLine 统一判断"是否追加状态行"，Graph 其余部分
+	// 对具体字段无感知。
+	Stats stats.Snapshot
 }
 
 // NewState 便捷构造器：以 Input 初始化 State，其余字段按零值处理。

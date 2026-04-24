@@ -40,6 +40,7 @@ import (
 	"github.com/echo/llm-bot/internal/agent/guard"
 	"github.com/echo/llm-bot/internal/agent/nodes"
 	"github.com/echo/llm-bot/internal/config"
+	"github.com/echo/llm-bot/internal/stats"
 	"github.com/echo/llm-bot/internal/store"
 )
 
@@ -48,6 +49,8 @@ type Deps struct {
 	History store.HistoryRepo
 	Persona *Persona
 	Logger  *slog.Logger
+	// Stats 可为 nil——表示关闭人设参数调制（好感度 / 心情 / 未来扩展）。
+	Stats *stats.Store
 }
 
 // Runnable 是 Agent 对外暴露的唯一执行形态。
@@ -95,7 +98,16 @@ func Build(ctx context.Context, cfg *config.Config, deps Deps) (Runnable, error)
 	// 反向依赖 agent 包（会形成 import 环）。
 	regexGateNode := guard.NewRegexGate(regex, deps.Logger)
 	loadHistoryNode := nodes.NewLoadHistory(deps.History, cfg.Agent.HistorySize, deps.Logger)
-	buildMessagesNode := nodes.NewBuildMessages(deps.Persona.BuildMessages)
+	// 仅在 stats.Store 可用时把 Snapshot 作为方法值传下去；stats 关闭时
+	// loadStats 保持 nil，buildMessages 节点会直接用 stats.Snapshot{} 调用
+	// BuildFunc，不追加状态行。
+	// (*stats.Store).Snapshot 的签名 func(ctx, userID) stats.Snapshot 与
+	// nodes.LoadStatsFunc 完全对齐，因此无需再包一层 lambda。
+	var loadStats nodes.LoadStatsFunc
+	if deps.Stats != nil {
+		loadStats = deps.Stats.Snapshot
+	}
+	buildMessagesNode := nodes.NewBuildMessages(deps.Persona.BuildMessages, loadStats)
 	guardedModelNode := guard.NewGuardedModel(mainModel, judge, deps.Logger)
 	postprocNode := nodes.NewPostproc()
 	fallbackNode := nodes.NewFallback(cfg.Guard.FallbackReplies)
@@ -181,7 +193,8 @@ func Build(ctx context.Context, cfg *config.Config, deps Deps) (Runnable, error)
 	deps.Logger.Info("agent graph compiled",
 		slog.Bool("judge_enabled", cfg.Guard.JudgeEnabled),
 		slog.Int("regex_count", len(cfg.Guard.RegexPatterns)),
-		slog.Int("history_size", cfg.Agent.HistorySize))
+		slog.Int("history_size", cfg.Agent.HistorySize),
+		slog.Bool("stats_enabled", deps.Stats != nil))
 
 	return runnable, nil
 }

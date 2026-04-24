@@ -65,3 +65,10 @@ trigger:
 # 日志级别：debug / info / warn / error
 log:
   level: "info"
+
+# 人设参数 stats（可选）：当前包含"好感度"（按用户）和"心情"（全局），
+# 未来可能加入其他影响回复风格的参数。
+# 启用后每条正常消息发送后会异步调一次 judge 模型给本轮对话打分，并把结果
+# 写入 Redis。失败只打日志、不影响对话。
+stats:
+  enabled: true

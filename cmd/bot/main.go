@@ -5,10 +5,11 @@
 //  2. 加载配置、构造 logger；
 //  3. 连 Redis，构造 HistoryRepo；
 //  4. 加载人设 YAML，构造 Persona；
-//  5. 构造 Agent Runnable（这一步会构造主/裁判 ChatModel、编译 Graph）；
-//  6. 构造 OneBot Adapter；
-//  7. 把 Bot 主循环跑起来；
-//  8. 监听 SIGINT/SIGTERM 做优雅关闭。
+//  5. 构造 stats 资源（若启用）：stats.Store 与打分 ChatModel；
+//  6. 构造 Agent Runnable（这一步会构造主/裁判 ChatModel、编译 Graph）；
+//  7. 构造 OneBot Adapter；
+//  8. 把 Bot 主循环跑起来；
+//  9. 监听 SIGINT/SIGTERM 做优雅关闭。
 package main
 
 import (
@@ -21,10 +22,12 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/cloudwego/eino/components/model"
 	"github.com/echo/llm-bot/internal/adapter/onebot"
 	"github.com/echo/llm-bot/internal/agent"
 	"github.com/echo/llm-bot/internal/bot"
 	"github.com/echo/llm-bot/internal/config"
+	"github.com/echo/llm-bot/internal/stats"
 	"github.com/echo/llm-bot/internal/store"
 )
 
@@ -65,27 +68,49 @@ func main() {
 		fatal("load persona: %v", err)
 	}
 
-	// Step 5: 构造 Agent Runnable
+	// Step 5: 构造 stats 资源（若启用）
+	// 产出两件东西:
+	//   - statsStore：传给 agent.Build，用于 buildMessages 节点读参数快照；
+	//   - scoreModel：传给 bot.New，用于 bot 层异步打分（Agent Graph 本身不用）。
+	// 打分模型复用 cfg.Judge——打分的负载特征（短 prompt、严格 JSON、低 QPS）
+	// 与 judge 接近，共享一份配置避免再引入一个 LLM 配置段。
+	//
+	// stats.enabled=false 时两者都保持 nil；agent/bot 两层都要求 nil-safe，
+	// main 这里无需塞哨兵对象。
+	var statsStore *stats.Store
+	var scoreModel model.BaseChatModel
+	if cfg.Stats.Enabled {
+		statsStore = stats.NewStore(redisCli, logger)
+		sm, err := agent.NewChatModel(ctx, cfg.Judge)
+		if err != nil {
+			fatal("build stats score model: %v", err)
+		}
+		scoreModel = sm
+		logger.Info("stats feature enabled")
+	}
+
+	// Step 6: 构造 Agent Runnable
 	runnable, err := agent.Build(ctx, cfg, agent.Deps{
 		History: historyRepo,
 		Persona: persona,
 		Logger:  logger,
+		Stats:   statsStore,
 	})
 	if err != nil {
 		fatal("build agent: %v", err)
 	}
 
-	// Step 6: 构造 OneBot Adapter
+	// Step 7: 构造 OneBot Adapter
 	ad := onebot.New(cfg.Server, cfg.Trigger, logger)
 	if err := ad.Start(ctx); err != nil {
 		fatal("start adapter: %v", err)
 	}
 
-	// Step 7: 跑主循环
-	b := bot.New(ad, runnable, logger)
+	// Step 8: 跑主循环
+	b := bot.New(ad, runnable, statsStore, scoreModel, logger)
 	b.Run(ctx) // 阻塞直到 ctx 被取消
 
-	// Step 8: 优雅关闭
+	// Step 9: 优雅关闭
 	logger.Info("shutting down")
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), defaultShutdownTimeout)
 	defer shutdownCancel()
