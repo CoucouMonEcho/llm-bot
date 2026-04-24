@@ -17,9 +17,11 @@
 // key 的滑动过期策略（见 store.history.go）刻意相反。
 //
 // 心情的"自然衰减"：人情绪上头总会冷静回来，同一个模型应体现在 mood 上。
-// 实现方式是让 mood 每过 moodRegressionInterval（10 分钟）就朝 0 方向回归 1 点，
-// 上限在 0——从正面回落不会穿到负面、反之亦然。衰减不用定时任务，而是在
-// "下一次真正要写 mood"的一刻懒结算（见 Store.applyMood）：
+// 实现方式是让 mood 每过 moodRegressionInterval（30 分钟）朝 moodBaseline（3）
+// 回归 1 点——比 0 略偏正是因为"默认心情微微好一点"比"绝对中性"更贴合人设，
+// 空闲时段回来的新对话不至于每次都从冷冰冰的 0 起步。收敛时不越过 baseline，
+// 即正向回落不会穿到负面、反之亦然。衰减不用定时任务，而是在"下一次真正要写
+// mood"的一刻懒结算（见 Store.applyMood）：
 //   - 省掉一个独立的后台 goroutine / 定时器；
 //   - 不活跃时段不产生任何 Redis 流量；
 //   - 读路径（Snapshot）保持为纯存储读，不做虚拟回归——下一轮 Dispatch 自然会
@@ -74,10 +76,16 @@ import (
 // 允许运维在 YAML 里改动会让打分契约与存储边界脱节，因此刻意不做配置化。
 const (
 	// Affinity 范围：0 为中性，正为喜欢，负为讨厌。
-	affMin, affMax = -100, 100
+	affMin, affMax = -20, 20
 
 	// Mood 范围：0 为平静，正为愉悦，负为烦躁。
-	moodMin, moodMax = -50, 50
+	moodMin, moodMax = -10, 10
+
+	// moodBaseline 是心情的自然回归目标——空闲时 mood 会朝这里收敛而不是 0。
+	// 选 3（即范围 [moodMin, moodMax] 的 30%）是为了让"默认心情"略带一点正向，
+	// 贴合"傲娇但内心其实不排斥聊天"的人设；落到 0 的中性值反而显得偏冷。
+	// 必须落在 [moodMin, moodMax] 之内，否则 applyMood 的 clamp 会把它再夹回来。
+	moodBaseline = 3
 
 	// 单轮打分的 delta 上限，与 Score prompt 里声明的范围保持一致；
 	// 解析后再 clamp 一次作为双保险，防止模型无视指令越界输出。
@@ -102,14 +110,14 @@ const (
 	// 把语义收敛成独立 field。
 	fieldLastChatAt = "last_chat_at"
 
-	// moodRegressionInterval 心情回归时间粒度：每过这么久 mood 就朝 0 方向
-	// 回归 1 点，上限是 0（不越过），下限依然受 [moodMin, moodMax] 约束。
+	// moodRegressionInterval 心情回归时间粒度：每过这么久 mood 就朝
+	// moodBaseline 方向回归 1 点，不越过 baseline，仍受 [moodMin, moodMax] 约束。
 	//
-	// 10 分钟的尺度是经验值：够短，闲置一个午休就能显著消解一次情绪波动；
+	// 30 分钟的尺度是经验值：够短，闲置半个多小时就能显著消解一次情绪波动；
 	// 够长，一轮活跃对话（通常 30 秒内）不会被衰减干扰。硬编码理由与
 	// moodMin/moodMax 一致——是语义模型的一部分，让运维能配置反而会让
 	// 调参面目全非。
-	moodRegressionInterval = 10 * time.Minute
+	moodRegressionInterval = 30 * time.Minute
 
 	// keyAffinity 存"按人头"的好感度——所有用户的好感度都在同一个 hash 里，
 	// field 通过 affinityField(platform, userID) 生成。
@@ -300,7 +308,7 @@ func incrHashAndClamp(ctx context.Context, rdb *redis.Client, key, field string,
 // 流程：
 //  1. HMGET 读取当前 mood 与 last_chat_at，field 缺失当 0 处理；
 //  2. 按 (now - last_chat_at) / moodRegressionInterval 计算整数衰减步数，
-//     朝 0 方向收敛（regressToZero 保证不越过 0）；
+//     朝 moodBaseline 方向收敛（regressToward 保证不越过 baseline）；
 //  3. 叠加本轮 delta 后 clamp 到 [moodMin, moodMax]；
 //  4. 一条 HSET 原子写回 mood 与 now 的 Unix 秒。
 //
@@ -329,7 +337,7 @@ func (s *Store) applyMood(ctx context.Context, delta int, now time.Time) error {
 	if lastUnix > 0 {
 		elapsed := now.Sub(time.Unix(lastUnix, 0))
 		if steps := int(elapsed / moodRegressionInterval); steps > 0 {
-			regressed = regressToZero(cur, steps)
+			regressed = regressToward(cur, moodBaseline, steps)
 		}
 	}
 	next := clamp(regressed+delta, moodMin, moodMax)
@@ -344,17 +352,17 @@ func (s *Store) applyMood(ctx context.Context, delta int, now time.Time) error {
 	return nil
 }
 
-// regressToZero 将 v 朝 0 方向收敛 steps 步，但不越过 0。steps 必须非负。
+// regressToward 将 v 朝 target 方向收敛 steps 步，但不越过 target。steps 必须非负。
 //
-// 正数向下减、负数向上加；两端都在 0 处截停。
-func regressToZero(v, steps int) int {
-	if v > 0 {
-		return max(0, v-steps)
+// v 高于 target 时向下减、低于 target 时向上加；两端都在 target 处截停。
+func regressToward(v, target, steps int) int {
+	if v > target {
+		return max(target, v-steps)
 	}
-	if v < 0 {
-		return min(0, v+steps)
+	if v < target {
+		return min(target, v+steps)
 	}
-	return 0
+	return target
 }
 
 // scoreSystemPrompt 是打分模型的 system message。
