@@ -12,6 +12,7 @@
 package nodes
 
 import (
+	"cmp"
 	"context"
 	"regexp"
 	"strings"
@@ -58,11 +59,7 @@ func postproc(_ context.Context, st *flow.State) (*flow.State, error) {
 		content = string(runes)
 	}
 
-	// Step 3: 确保非空。
-	if content == "" {
-		content = "嗯，我一时没组织好语言，换个说法再问我一次？"
-	}
-
-	st.Reply.Content = content
+	// Step 3: 确保非空——清洗后若空，兜底一句温和的占位回复。
+	st.Reply.Content = cmp.Or(content, "我去洗澡了")
 	return st, nil
 }

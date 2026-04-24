@@ -112,9 +112,11 @@ func (b *Bot) handle(parent context.Context, m *domain.InboundMessage) {
 		slog.String("user", m.UserID))
 
 	// Step 1: 构造 Graph 入参
-	// UserID 透传给 Graph：stats 按人头维度读写（好感度按 UserID 分 key），
-	// 群聊里一个 SessionID 对应多个 UserID，不能用 SessionID 顶替。
+	// UserID 透传给 Graph：stats 按人头维度读写（好感度的 hash field 形如
+	// "<platform>_<userID>"），群聊里一个 SessionID 对应多个 UserID，
+	// 不能用 SessionID 顶替；Platform 用来在跨平台场景里隔离同号用户。
 	in := &flow.Input{
+		Platform:  string(m.Platform),
 		SessionID: m.SessionID,
 		UserID:    m.UserID,
 		Query:     m.Text,
@@ -164,7 +166,7 @@ func (b *Bot) handle(parent context.Context, m *domain.InboundMessage) {
 	// "挨骂→心情变差→后续回复更烦躁" 的反馈闭环成立。
 	if b.statsStore != nil && b.scoreModel != nil && m.UserID != "" {
 		stats.Dispatch(b.statsStore, b.scoreModel, b.logger,
-			m.UserID, m.Text, state.Reply.Content)
+			string(m.Platform), m.UserID, m.Text, state.Reply.Content)
 	}
 }
 

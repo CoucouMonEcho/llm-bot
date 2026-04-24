@@ -101,8 +101,8 @@ func Build(ctx context.Context, cfg *config.Config, deps Deps) (Runnable, error)
 	// 仅在 stats.Store 可用时把 Snapshot 作为方法值传下去；stats 关闭时
 	// loadStats 保持 nil，buildMessages 节点会直接用 stats.Snapshot{} 调用
 	// BuildFunc，不追加状态行。
-	// (*stats.Store).Snapshot 的签名 func(ctx, userID) stats.Snapshot 与
-	// nodes.LoadStatsFunc 完全对齐，因此无需再包一层 lambda。
+	// (*stats.Store).Snapshot 的签名 func(ctx, platform, userID) stats.Snapshot
+	// 与 nodes.LoadStatsFunc 完全对齐，因此无需再包一层 lambda。
 	var loadStats nodes.LoadStatsFunc
 	if deps.Stats != nil {
 		loadStats = deps.Stats.Snapshot

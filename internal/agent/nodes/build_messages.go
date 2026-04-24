@@ -34,10 +34,12 @@ type BuildFunc func(history []*schema.Message, query string, snap stats.Snapshot
 // LoadStatsFunc 返回某用户当前的人设参数快照。允许为 nil——表示 stats 功能
 // 关闭，buildMessages 节点会直接用 stats.Snapshot{} 调用 BuildFunc。
 //
-// 签名刻意与 (*stats.Store).Snapshot 对齐，不返回 error：stats 读属于装饰性
-// 功能，任何失败都应 fail-soft 返回零值，而不是让本节点把错误冒泡到 Graph
-// 中断正常对话。
-type LoadStatsFunc func(ctx context.Context, userID string) stats.Snapshot
+// 签名刻意与 (*stats.Store).Snapshot 对齐（platform, userID），不返回 error：
+// stats 读属于装饰性功能，任何失败都应 fail-soft 返回零值，而不是让本节点
+// 把错误冒泡到 Graph 中断正常对话。
+//
+// platform 用来把 affinity hash 里的 field 按平台隔开，避免跨平台同号撞车。
+type LoadStatsFunc func(ctx context.Context, platform, userID string) stats.Snapshot
 
 // NewBuildMessages 构造 buildMessages 节点。
 //
@@ -63,8 +65,10 @@ func NewBuildMessages(build BuildFunc, loadStats LoadStatsFunc) *compose.Lambda 
 		// loadStats 未注入或 UserID 缺失时 st.Stats 保持零值，BuildFunc 会
 		// 跳过状态行。这条路径同时覆盖"stats 关闭"和"上游忘记填 UserID"
 		// 两种场景——fail-soft，不拖累主对话。
+		// Platform 即使为空，loadStats 里也会有兜底（用 "unknown" 前缀），
+		// 因此不拿它做短路条件——漏传 platform 不该静默丢失好感度记录。
 		if loadStats != nil && st.In.UserID != "" {
-			st.Stats = loadStats(ctx, st.In.UserID)
+			st.Stats = loadStats(ctx, st.In.Platform, st.In.UserID)
 		}
 		msgs, err := build(st.History, st.In.Query, st.Stats)
 		if err != nil {

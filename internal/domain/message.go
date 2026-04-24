@@ -19,9 +19,9 @@ const (
 type ConversationType string
 
 const (
-	// ConversationPrivate 表示私聊，SessionID 形如 "private:<user_id>"。
+	// ConversationPrivate 表示私聊，SessionID 形如 "private_<user_id>"。
 	ConversationPrivate ConversationType = "private"
-	// ConversationGroup 表示群聊，SessionID 形如 "group:<group_id>"。
+	// ConversationGroup 表示群聊，SessionID 形如 "group_<group_id>"。
 	ConversationGroup ConversationType = "group"
 )
 
@@ -33,7 +33,7 @@ type InboundMessage struct {
 	// ConvType 会话类型：私聊或群聊。
 	ConvType ConversationType
 	// SessionID 会话唯一标识，Redis 历史 key 的一部分。
-	// 私聊：private:<user_id>；群聊：group:<group_id>（群内所有成员共享同一会话）。
+	// 私聊：private_<user_id>；群聊：group_<group_id>（群内所有成员共享同一会话）。
 	SessionID string
 	// UserID 触发本次消息的用户，用于日志与可能的鉴权。
 	UserID string

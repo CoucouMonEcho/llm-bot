@@ -6,6 +6,7 @@
 package onebot
 
 import (
+	"cmp"
 	"encoding/json"
 	"fmt"
 	"strconv"
@@ -110,16 +111,14 @@ func decodeAndFilter(raw []byte, selfID int64, tr config.Trigger) (*domain.Inbou
 
 	// Step 4: 组装 InboundMessage。
 	convType := domain.ConversationPrivate
-	sessionID := "private:" + strconv.FormatInt(ev.UserID, 10)
+	sessionID := "private_" + strconv.FormatInt(ev.UserID, 10)
 	if ev.MessageType == "group" {
 		convType = domain.ConversationGroup
-		sessionID = "group:" + strconv.FormatInt(ev.GroupID, 10)
+		sessionID = "group_" + strconv.FormatInt(ev.GroupID, 10)
 	}
 
-	userName := ev.Sender.Card
-	if userName == "" {
-		userName = ev.Sender.Nickname
-	}
+	// 群名片（Card）优先于昵称（Nickname）：群聊里用户可能自定义了更亲切的群名片。
+	userName := cmp.Or(ev.Sender.Card, ev.Sender.Nickname)
 
 	return &domain.InboundMessage{
 		Platform:  domain.PlatformOneBot,
@@ -244,7 +243,7 @@ func toInt64(v any) (int64, error) {
 func buildSendAction(out *domain.OutboundMessage) ([]byte, error) {
 	switch out.ConvType {
 	case domain.ConversationPrivate:
-		userID, err := parseSessionIDSuffix(out.SessionID, "private:")
+		userID, err := parseSessionIDSuffix(out.SessionID, "private_")
 		if err != nil {
 			return nil, err
 		}
@@ -256,7 +255,7 @@ func buildSendAction(out *domain.OutboundMessage) ([]byte, error) {
 			},
 		})
 	case domain.ConversationGroup:
-		groupID, err := parseSessionIDSuffix(out.SessionID, "group:")
+		groupID, err := parseSessionIDSuffix(out.SessionID, "group_")
 		if err != nil {
 			return nil, err
 		}
@@ -322,7 +321,7 @@ func buildGroupMessageField(out *domain.OutboundMessage) (any, error) {
 	return segs, nil
 }
 
-// parseSessionIDSuffix 从 "private:123" 形式的 SessionID 中提取数字部分。
+// parseSessionIDSuffix 从 "private_123" 形式的 SessionID 中提取数字部分。
 func parseSessionIDSuffix(sessionID, prefix string) (int64, error) {
 	s := strings.TrimPrefix(sessionID, prefix)
 	if s == sessionID {

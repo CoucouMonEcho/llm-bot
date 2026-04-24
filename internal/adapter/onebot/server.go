@@ -15,6 +15,7 @@
 package onebot
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -175,10 +176,8 @@ func (a *Adapter) Send(ctx context.Context, out *domain.OutboundMessage) error {
 func (a *Adapter) handleWS(w http.ResponseWriter, r *http.Request) {
 	// Step 1: 校验 access_token（NapCat 会把 token 放在 Authorization 头里）。
 	if a.cfg.AccessToken != "" {
-		token := extractBearer(r.Header.Get("Authorization"))
-		if token == "" {
-			token = r.Header.Get("X-Self-Token") // 兼容部分客户端
-		}
+		// 优先 Authorization Bearer，空时兜底到 X-Self-Token（部分客户端走这个头）。
+		token := cmp.Or(extractBearer(r.Header.Get("Authorization")), r.Header.Get("X-Self-Token"))
 		if token != a.cfg.AccessToken {
 			a.logger.Warn("onebot ws auth failed", slog.String("remote", r.RemoteAddr))
 			http.Error(w, "unauthorized", http.StatusUnauthorized)

@@ -15,9 +15,15 @@ import (
 )
 
 // Input 是从 Bot 主循环喂进 Graph 的入参。
-// 字段设计刻意精简——平台相关字段留在 domain.InboundMessage 里，
-// 不进入 Graph。
+// 字段设计刻意精简——只保留 Agent 层真正消费的最小集。
 type Input struct {
+	// Platform 消息来源平台的字符串标识（例如 "onebot"）。
+	// stats 按"平台 + 用户"维度隔离好感度：将来接入微信 / Telegram 时，
+	// 同号 userID 不会被误判为同一人。
+	// 用 string 而不是 domain.Platform：避免 flow 反向依赖 domain，
+	// 让 flow 保持为纯"Graph 管道类型"的叶子包。调用方（bot.handle）
+	// 传 string(m.Platform) 即可。
+	Platform string
 	// SessionID 对话的唯一标识，用于 Redis key 和日志。
 	SessionID string
 	// UserID 触发本次消息的用户 ID。

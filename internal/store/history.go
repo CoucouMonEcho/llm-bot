@@ -2,8 +2,10 @@
 //
 // 数据模型：
 //   - 每一条消息以 JSON 形式序列化后 LPUSH 到一个 Redis List；
-//   - key 形如 "bot:hist:<platform>:<sessionID>"；
+//   - key 形如 "bot_hist_<sessionID>"（sessionID 自身已带 private_/group_ 前缀）；
 //   - 每次写入后用 LTRIM 0 max-1 保留最新的 max 条，避免 List 无限增长；
+//   - 每次写入后以滑动窗口 EXPIRE 30 天：活跃会话永不过期，长期沉默的会话
+//     会自然回收，既省内存也让"隔半年回来"的上下文不会诡异地拼到当下对话中；
 //   - 读取时用 LRANGE 0 n-1 后再按"时间从旧到新"反转，以便喂给 LLM。
 //
 // 设计思考：
@@ -33,10 +35,21 @@ type HistoryRepo interface {
 	Load(ctx context.Context, sessionID string, n int) ([]*schema.Message, error)
 }
 
+// historyTTL 是单条会话历史 key 的滑动窗口过期时间。
+//
+// 采用"每次 Append 都刷新 EXPIRE"的滑动窗口策略：
+//   - 活跃用户的会话被每次对话持续续期，实际永不过期；
+//   - 长期沉默（超过 30 天）的会话会被 Redis 自然清理，避免 key 无限堆积；
+//   - 实现成本极低——只要在 LPUSH/LTRIM 同一 pipeline 里多加一条 EXPIRE 即可，
+//     不需要先 EXISTS 探测或 EXPIRE NX。
+const historyTTL = 30 * 24 * time.Hour
+
 // redisHistoryRepo 是 HistoryRepo 的 Redis 实现。
 type redisHistoryRepo struct {
 	cli *redis.Client
-	// keyPrefix 是所有历史 key 的公共前缀，默认 "bot:hist:"。
+	// keyPrefix 是所有历史 key 的公共前缀，默认 "bot_hist_"。
+	// 全部用 '_' 作分隔而不是 ':'，是为了让项目里所有 Redis key 的层级分隔符
+	// 统一（stats / history 都一样），扫 key 时不用记混。
 	// 将来若多租户部署，可通过构造器参数化。
 	keyPrefix string
 }
@@ -45,7 +58,7 @@ type redisHistoryRepo struct {
 func NewHistoryRepo(cli *redis.Client) HistoryRepo {
 	return &redisHistoryRepo{
 		cli:       cli,
-		keyPrefix: "bot:hist:",
+		keyPrefix: "bot_hist_",
 	}
 }
 
@@ -59,14 +72,15 @@ type historyEntry struct {
 
 // Append 实现 HistoryRepo。
 //
-// 执行步骤：
+// 执行步骤（单次 pipeline 发送）：
 //  1. 序列化 msg 为 JSON；
 //  2. LPUSH 到 session 对应的 List（新消息在 index 0）；
-//  3. 若 maxLen>0，用 LTRIM 保留 [0, maxLen-1]。
+//  3. 若 maxLen>0，用 LTRIM 保留 [0, maxLen-1]；
+//  4. EXPIRE 刷新为 historyTTL——每次对话都续期的"滑动窗口"。
 //
-// 这两条写命令未使用 MULTI 封装：单条消息写入 + 裁剪的并发安全性对于
-// "对话历史"而言不是严苛需求——偶尔多出一条不会造成正确性问题。
-// 若将来需要严格 atomic，改为 pipeline + TxPipeline 即可。
+// 这组命令未使用 MULTI 封装：单条消息写入 + 裁剪 + 续期的并发安全性对于
+// "对话历史"而言不是严苛需求——偶尔多出一条、TTL 早晚几毫秒都不构成正确性
+// 问题。若将来需要严格 atomic，改为 TxPipeline 即可。
 func (r *redisHistoryRepo) Append(ctx context.Context, sessionID string, msg *schema.Message, maxLen int) error {
 	if msg == nil {
 		return fmt.Errorf("store: append nil message")
@@ -87,6 +101,9 @@ func (r *redisHistoryRepo) Append(ctx context.Context, sessionID string, msg *sc
 	if maxLen > 0 {
 		pipe.LTrim(ctx, key, 0, int64(maxLen-1))
 	}
+	// 滑动窗口续期：每次 Append 都刷新为 historyTTL，对长期不活跃的会话
+	// 由 Redis 自然过期回收。LPUSH 之后执行，保证 key 一定存在，EXPIRE 生效。
+	pipe.Expire(ctx, key, historyTTL)
 	if _, err := pipe.Exec(ctx); err != nil {
 		return fmt.Errorf("store: append history: %w", err)
 	}
