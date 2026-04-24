@@ -19,7 +19,7 @@ build:
 	go build $(GOFLAGS) -o $(BIN) $(PKG)
 
 run: build
-	./$(BIN) -config $(CONFIG)
+	nohup ./$(BIN) -config $(CONFIG) > output.log 2>&1 &
 
 tidy:
 	go mod tidy
