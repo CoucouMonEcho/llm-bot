@@ -1,6 +1,6 @@
 // Package nodes 的 fallback.go 是"被 guard 判定为攻击时"的降级回复节点。
 //
-// 位置：guard(Verdict.Blocked) → fallback → END。
+// 位置：guard(Verdict.Blocked) → fallback → scoreStats → END。
 //
 // 实现要点：
 //   - 候选回复池通过配置注入（guard.fallback_replies），代码只负责"随机选一条"；

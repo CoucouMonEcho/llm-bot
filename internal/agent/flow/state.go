@@ -36,7 +36,7 @@ type Input struct {
 	// Query 用户的原始文本（已经去掉 @、前缀等触发标记）。
 	Query string
 	// UserName 触发用户的昵称。当前 Persona.BuildMessages 尚未消费此字段，
-	// 保留以便未来把称呼注入 system prompt 或少样例（Few-shot）时使用。
+	// 保留以便未来把称呼注入系统提示词或少样例（Few-shot）时使用。
 	UserName string
 }
 
@@ -102,7 +102,7 @@ type State struct {
 	In *Input
 
 	// History 是 loadHistory 节点从 Redis 拉回的历史消息（旧→新）。
-	// 读取失败时为 nil 切片；downstream 应当视 nil 与空切片等价。
+	// 读取失败时为 nil 切片；下游应当视 nil 与空切片等价。
 	History []*schema.Message
 
 	// Messages 是 buildMessages 节点组装好的"system + history + current"消息列表，
@@ -118,9 +118,9 @@ type State struct {
 	Verdict Verdict
 
 	// Stats 是本轮对话开始时的人设参数快照（当前含好感度 + 心情，可扩展）。
-	// 由 buildMessages 节点在装配 system prompt 之前填入；若该节点没接到
-	// LoadStatsFunc（stats 功能关闭）则保持零值 Snapshot{}，此时 PromptLine
-	// 只渲染当前时间一行，好感度 / 心情段省略。Graph 其余部分对具体字段无感知。
+	// 由 prepareStats 节点在装配系统提示词之前填入；若 stats 功能关闭或
+	// UserID 缺失则保持零值 Snapshot{}，此时 PromptLine 只渲染当前时间一行，
+	// 好感度 / 心情段省略。Graph 其余部分对具体字段无感知。
 	Stats stats.Snapshot
 }
 

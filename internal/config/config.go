@@ -20,25 +20,91 @@ import (
 
 // Config 是整个应用的配置根对象，字段与 configs/config.yaml 一一对应。
 type Config struct {
-	Server  Server  `yaml:"server"`
-	Redis   Redis   `yaml:"redis"`
-	LLM     LLM     `yaml:"llm"`
-	Judge   LLM     `yaml:"judge"`
-	Agent   Agent   `yaml:"agent"`
-	Guard   Guard   `yaml:"guard"`
-	Trigger Trigger `yaml:"trigger"`
-	Log     Log     `yaml:"log"`
-	Stats   Stats   `yaml:"stats"`
+	Server    Server    `yaml:"server"`
+	Redis     Redis     `yaml:"redis"`
+	LLM       LLM       `yaml:"llm"`
+	Judge     LLM       `yaml:"judge"`
+	Agent     Agent     `yaml:"agent"`
+	Guard     Guard     `yaml:"guard"`
+	Trigger   Trigger   `yaml:"trigger"`
+	Log       Log       `yaml:"log"`
+	Stats     Stats     `yaml:"stats"`
+	Proactive Proactive `yaml:"proactive"`
 }
 
 // Stats 控制"人设参数"功能（当前含好感度 + 心情，可扩展为疲劳度、信任度等
 // 影响回复风格的参数）。
 //
-// Enabled=false 时，bot 不调打分模型、agent 不读 Redis stats key，system
-// prompt 中也不会出现状态行。Enabled=true 时复用 cfg.Judge 的 LLM 作为打分
+// Enabled=false 时，bot 不调打分模型、agent 不读 Redis stats key，系统提示词
+// 中也不会出现状态行。Enabled=true 时复用 cfg.Judge 的 LLM 作为打分
 // 模型，不额外引入新的 LLM 配置段。
 type Stats struct {
 	Enabled bool `yaml:"enabled"`
+}
+
+// Proactive 控制主动发消息的静态策略。YAML 只保存部署期参数；
+// 运行期开关和群白名单保存在 Redis，避免改配置文件才能临时停用某个群。
+//
+// 只有 Enabled=true 且 Redis 开关也开启时，scheduler 才会尝试发送。
+// 这里的时间字段保留为秒数，是为了让配置文件易读；对外统一通过方法转成
+// time.Duration，避免调用方散落重复换算。
+type Proactive struct {
+	// Enabled 是配置侧总开关；关闭时不构造主动消息调度链路。
+	Enabled bool `yaml:"enabled"`
+	// WindowStart / WindowEnd 是每天允许主动发送的时间窗边界，格式为 HH:MM。
+	// 默认允许跨天窗口（例如 10:00 到 01:00），以覆盖深夜仍活跃的群。
+	WindowStart string `yaml:"window_start"`
+	WindowEnd   string `yaml:"window_end"`
+	// MinSinceLastInboundSec 要求用户最后发言至少过去多久，避免刚聊完就追发。
+	MinSinceLastInboundSec int `yaml:"min_since_last_inbound_sec"`
+	// MaxSinceLastInboundSec 要求用户最后发言不能太久远，避免打扰已经沉寂的会话。
+	MaxSinceLastInboundSec int `yaml:"max_since_last_inbound_sec"`
+	// IntervalSec 是调度器基础扫描间隔；真实间隔还会叠加 JitterMaxSec 抖动。
+	IntervalSec int `yaml:"interval_sec"`
+	// JitterMaxSec 是每轮调度额外随机等待的上限，用来打散固定整点发送痕迹。
+	JitterMaxSec int `yaml:"jitter_max_sec"`
+	// TopN 限制每轮只从最近最相关的一批候选中挑选，避免全量扫描 Redis 排行。
+	TopN int `yaml:"top_n"`
+	// DailyLimit 限制单日主动发送总量，防止异常配置或模型输出造成刷屏。
+	DailyLimit int `yaml:"daily_limit"`
+	// SessionCooldownSec 限制同一会话的主动发送频率。
+	SessionCooldownSec int `yaml:"session_cooldown_sec"`
+	// PendingTTLSec 是主动消息短上下文的保留时长，用于接住用户对主动消息的回复。
+	PendingTTLSec int `yaml:"pending_ttl_sec"`
+	// RecentEventsCap 限制每个会话记录的近期事件数量，控制候选选择时的 Redis 成本。
+	RecentEventsCap int `yaml:"recent_events_cap"`
+	// DryRun 只生成和记录决策，不真正发送；用于上线前观察候选质量。
+	DryRun bool `yaml:"dry_run"`
+}
+
+// MinSinceLastInbound 返回用户最后发言的最短间隔。
+func (p Proactive) MinSinceLastInbound() time.Duration {
+	return seconds(p.MinSinceLastInboundSec)
+}
+
+// MaxSinceLastInbound 返回用户最后发言的最长间隔。
+func (p Proactive) MaxSinceLastInbound() time.Duration {
+	return seconds(p.MaxSinceLastInboundSec)
+}
+
+// Interval 返回主动调度的基础间隔。
+func (p Proactive) Interval() time.Duration {
+	return seconds(p.IntervalSec)
+}
+
+// JitterMax 返回主动调度额外抖动的上限。
+func (p Proactive) JitterMax() time.Duration {
+	return seconds(p.JitterMaxSec)
+}
+
+// SessionCooldown 返回同一 session 的主动发送冷却时间。
+func (p Proactive) SessionCooldown() time.Duration {
+	return seconds(p.SessionCooldownSec)
+}
+
+// PendingTTL 返回主动消息短上下文的保留时长。
+func (p Proactive) PendingTTL() time.Duration {
+	return seconds(p.PendingTTLSec)
 }
 
 // Server 描述对外提供的 HTTP / WebSocket 服务。
@@ -51,7 +117,7 @@ type Server struct {
 	AccessToken string `yaml:"access_token"`
 }
 
-// Redis 只用于 History 的持久化；本项目不做集群/哨兵支持。
+// Redis 用于 History、stats 和 proactive 运行期状态；本项目不做集群/哨兵支持。
 type Redis struct {
 	Addr     string `yaml:"addr"`
 	Password string `yaml:"password"`
@@ -72,7 +138,14 @@ func (l LLM) Timeout() time.Duration {
 	if l.TimeoutSec <= 0 {
 		return 0
 	}
-	return time.Duration(l.TimeoutSec) * time.Second
+	return seconds(l.TimeoutSec)
+}
+
+func seconds(v int) time.Duration {
+	if v <= 0 {
+		return 0
+	}
+	return time.Duration(v) * time.Second
 }
 
 // Agent 聚合 Agent 层相关参数。
@@ -128,7 +201,9 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("config: read %s: %w", path, err)
 	}
 
-	var cfg Config
+	cfg := Config{
+		Proactive: defaultProactive(),
+	}
 	if err := yaml.Unmarshal(raw, &cfg); err != nil {
 		return nil, fmt.Errorf("config: unmarshal %s: %w", path, err)
 	}
@@ -186,6 +261,75 @@ func (c *Config) validate() error {
 	}
 	if len(c.Guard.FallbackReplies) == 0 {
 		return fmt.Errorf("config: guard.fallback_replies must contain at least one entry")
+	}
+	if err := c.validateProactive(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func defaultProactive() Proactive {
+	return Proactive{
+		Enabled:                false,
+		WindowStart:            "10:00",
+		WindowEnd:              "01:00",
+		MinSinceLastInboundSec: int((1 * time.Hour) / time.Second),
+		MaxSinceLastInboundSec: int((6 * time.Hour) / time.Second),
+		IntervalSec:            int((1 * time.Hour) / time.Second),
+		JitterMaxSec:           int((10 * time.Minute) / time.Second),
+		TopN:                   50,
+		DailyLimit:             3,
+		SessionCooldownSec:     int((6 * time.Hour) / time.Second),
+		PendingTTLSec:          int((30 * time.Minute) / time.Second),
+		RecentEventsCap:        200,
+		DryRun:                 true,
+	}
+}
+
+func (c *Config) validateProactive() error {
+	defaults := defaultProactive()
+	if c.Proactive.WindowStart == "" {
+		c.Proactive.WindowStart = defaults.WindowStart
+	}
+	if c.Proactive.WindowEnd == "" {
+		c.Proactive.WindowEnd = defaults.WindowEnd
+	}
+	if c.Proactive.MinSinceLastInboundSec <= 0 {
+		c.Proactive.MinSinceLastInboundSec = defaults.MinSinceLastInboundSec
+	}
+	if c.Proactive.MaxSinceLastInboundSec <= 0 {
+		c.Proactive.MaxSinceLastInboundSec = defaults.MaxSinceLastInboundSec
+	}
+	if c.Proactive.IntervalSec <= 0 {
+		c.Proactive.IntervalSec = defaults.IntervalSec
+	}
+	if c.Proactive.JitterMaxSec < 0 {
+		return fmt.Errorf("config: proactive.jitter_max_sec must be >= 0")
+	}
+	if c.Proactive.TopN <= 0 {
+		c.Proactive.TopN = defaults.TopN
+	}
+	if c.Proactive.DailyLimit <= 0 {
+		c.Proactive.DailyLimit = defaults.DailyLimit
+	}
+	if c.Proactive.SessionCooldownSec <= 0 {
+		c.Proactive.SessionCooldownSec = defaults.SessionCooldownSec
+	}
+	if c.Proactive.PendingTTLSec <= 0 {
+		c.Proactive.PendingTTLSec = defaults.PendingTTLSec
+	}
+	if c.Proactive.RecentEventsCap <= 0 {
+		c.Proactive.RecentEventsCap = defaults.RecentEventsCap
+	}
+
+	if _, err := time.Parse("15:04", c.Proactive.WindowStart); err != nil {
+		return fmt.Errorf("config: proactive.window_start must use HH:MM: %w", err)
+	}
+	if _, err := time.Parse("15:04", c.Proactive.WindowEnd); err != nil {
+		return fmt.Errorf("config: proactive.window_end must use HH:MM: %w", err)
+	}
+	if c.Proactive.MinSinceLastInboundSec > c.Proactive.MaxSinceLastInboundSec {
+		return fmt.Errorf("config: proactive.min_since_last_inbound_sec must be <= proactive.max_since_last_inbound_sec")
 	}
 	return nil
 }

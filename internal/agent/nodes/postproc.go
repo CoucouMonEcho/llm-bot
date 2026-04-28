@@ -1,7 +1,7 @@
 // Package nodes 实现 Agent Graph 中的非 guard Lambda 节点。
 //
 // 本文件：postproc 节点。
-// 位置：guard(未拦截) → postproc → saveHistory。
+// 位置：guard(未拦截) → postproc → saveHistory → scoreStats。
 // 职责：对主链产出的 Reply 做"发送前清洗"——裁剪空白、限制长度、
 // 剥除潜在的"泄露 system prompt"式片段。
 //
@@ -49,18 +49,18 @@ func postproc(_ context.Context, st *flow.State) (*flow.State, error) {
 
 	content := st.Reply.Content
 
-	// Step 1: 修剪空白 & 折叠多余空行。
+	// 第一步：修剪空白并折叠多余空行。
 	content = strings.TrimSpace(content)
 	content = collapseBlankLines.ReplaceAllString(content, "\n\n")
 
-	// Step 2: 按 rune 截断以兼容中文。
+	// 第二步：按 rune 截断以兼容中文。
 	runes := []rune(content)
 	if len(runes) > maxReplyRunes {
 		runes = append(runes[:maxReplyRunes], []rune("……")...)
 		content = string(runes)
 	}
 
-	// Step 3: 确保非空——清洗后若空，兜底一句温和的占位回复。
+	// 第三步：确保非空——清洗后若空，兜底一句温和的占位回复。
 	st.Reply.Content = cmp.Or(content, "我去洗澡了")
 	return st, nil
 }

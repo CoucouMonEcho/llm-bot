@@ -1,4 +1,4 @@
-// Package bot 提供最顶层的"消息循环 plumbing"——把 Adapter 的接收
+// Package bot 提供最顶层的"消息循环管道"——把 Adapter 的接收
 // 事件灌进 Agent Runnable，把结果回发到 Adapter。
 //
 // 这个包刻意做得很薄。它不应该承载任何业务判断（那些都在 Agent Graph 中），
@@ -11,20 +11,18 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cloudwego/eino/components/model"
 	"github.com/echo/llm-bot/internal/adapter"
 	"github.com/echo/llm-bot/internal/agent"
 	"github.com/echo/llm-bot/internal/agent/flow"
 	"github.com/echo/llm-bot/internal/domain"
-	"github.com/echo/llm-bot/internal/stats"
 )
 
 // maxConcurrent 单进程同时处理的最大消息数。
-// 这个值限制了 Redis / LLM 的并发压力；超出时新消息会排队等待 channel 消费。
+// 这个值限制了 Redis / LLM 的并发压力；超出时新消息会排队等待通道消费。
 const maxConcurrent = 32
 
 // replyTimeout 单条消息从触发到发送完成的最大时长。
-// 超时意味着整个链路（guard + 主链 + postproc + saveHistory + 发送）都断掉。
+// 超时意味着整个链路（防护、主链、后处理、落历史、发送）都断掉。
 const replyTimeout = 60 * time.Second
 
 // Bot 聚合 Adapter 与 Runnable，是整个服务的"大主循环"载体。
@@ -33,43 +31,46 @@ type Bot struct {
 	runnable agent.Runnable
 	logger   *slog.Logger
 
-	// statsStore 为 nil 表示 stats 功能关闭；handle 中必须先判空再使用。
-	statsStore *stats.Store
-	// scoreModel 用于 stats.Dispatch 的异步打分；statsStore 非 nil 时应非 nil，
-	// 但为了防御性编程（例如运维在 main 里改出了不一致的组合），handle 中
-	// 两个字段都要判空，缺任一项就整体跳过参数更新，而不是 panic。
-	scoreModel model.BaseChatModel
+	activityRecorder ActivityRecorder
 
 	sem chan struct{} // 并发信号量
+}
+
+// ActivityRecorder 是 Bot 写入主动消息候选索引所需的最小接口。
+//
+// Bot 只知道"真实入站消息刚发生"，不应该知道主动消息如何按好感度排序、
+// 如何写 Redis key、如何读运行期开关。因此这里收敛成一个无返回值接口：
+// 实现侧负责软降级和日志，记录失败不能中断主回复链路，也不能迫使 bot 包
+// 反向依赖 proactive 包。
+type ActivityRecorder interface {
+	// RecordInbound 记录一条真实入站消息，用于后续主动消息候选选择、冷却判断和短上下文拼接。
+	RecordInbound(ctx context.Context, msg *domain.InboundMessage)
 }
 
 // New 构造一个 Bot。
 //
 // ad 可以是任何满足 adapter.Adapter 的实现；rn 是 agent.Build 的返回值。
-// statsStore / scoreModel 可以同时为 nil，表示关闭 stats 功能；同时非 nil 则开启。
-// 不在 New 里校验"一开一关"的半开状态——这类配置一致性由 main 层负责保障，
-// Bot 只做防御性判空即可。
-func New(ad adapter.Adapter, rn agent.Runnable, statsStore *stats.Store, scoreModel model.BaseChatModel, logger *slog.Logger) *Bot {
+// stats 打分由 Agent Graph 的 scoreStats 节点在"回复已生成"时触发，Bot 只负责发送。
+func New(ad adapter.Adapter, rn agent.Runnable, recorder ActivityRecorder, logger *slog.Logger) *Bot {
 	return &Bot{
-		adapter:    ad,
-		runnable:   rn,
-		logger:     logger.With(slog.String("component", "bot")),
-		statsStore: statsStore,
-		scoreModel: scoreModel,
-		sem:        make(chan struct{}, maxConcurrent),
+		adapter:          ad,
+		runnable:         rn,
+		logger:           logger.With(slog.String("component", "bot")),
+		activityRecorder: recorder,
+		sem:              make(chan struct{}, maxConcurrent),
 	}
 }
 
-// Run 启动主循环，阻塞直到 ctx 取消或 Adapter 的 Receive channel 关闭。
+// Run 启动主循环，阻塞直到 ctx 取消或 Adapter 的接收通道关闭。
 //
-// 每收到一条消息，用 semaphore 限流后交给独立的 goroutine 处理，
+// 每收到一条消息，用信号量限流后交给独立的 goroutine 处理，
 // 避免单条慢请求阻塞后续消息。
 func (b *Bot) Run(ctx context.Context) {
 	var wg sync.WaitGroup
 
 	b.logger.Info("bot loop started")
 	defer func() {
-		// 等所有 in-flight handle goroutine 收尾，避免进程退出时丢消息。
+		// 等所有正在处理的 handle goroutine 收尾，避免进程退出时丢消息。
 		wg.Wait()
 		b.logger.Info("bot loop exited")
 	}()
@@ -103,6 +104,9 @@ func (b *Bot) Run(ctx context.Context) {
 //  2. 调用 Runnable.Invoke，得到 flow.State；
 //  3. 把 state.Reply 包成 OutboundMessage 回发；
 //  4. 全程带 replyTimeout 以保证慢请求不会泄漏协程。
+//
+// stats 打分不在这里做：Agent Graph 已在回复生成后通过 scoreStats 异步触发，
+// 不再把参数更新绑定到 Adapter 发送成功与否。
 func (b *Bot) handle(parent context.Context, m *domain.InboundMessage) {
 	ctx, cancel := context.WithTimeout(parent, replyTimeout)
 	defer cancel()
@@ -111,8 +115,14 @@ func (b *Bot) handle(parent context.Context, m *domain.InboundMessage) {
 		slog.String("session", m.SessionID),
 		slog.String("user", m.UserID))
 
-	// Step 1: 构造 Graph 入参
-	// UserID 透传给 Graph：stats 按人头维度读写（好感度的 hash field 形如
+	if b.activityRecorder != nil {
+		// 先记录活跃再进 Graph：即便后续 LLM 调用失败，"这个人刚来过"仍是事实。
+		// 记录接口不返回错误，主动消息索引故障只在实现侧降级。
+		b.activityRecorder.RecordInbound(ctx, m)
+	}
+
+	// 步骤 1：构造 Graph 入参。
+	// UserID 透传给 Graph：stats 按人头维度读写（好感度的 ZSET member 形如
 	// "<platform>_<userID>"），群聊里一个 SessionID 对应多个 UserID，
 	// 不能用 SessionID 顶替；Platform 用来在跨平台场景里隔离同号用户。
 	in := &flow.Input{
@@ -123,7 +133,7 @@ func (b *Bot) handle(parent context.Context, m *domain.InboundMessage) {
 		UserName:  m.UserName,
 	}
 
-	// Step 2: 驱动 Graph
+	// 步骤 2：驱动 Graph。
 	state, err := b.runnable.Invoke(ctx, in)
 	if err != nil {
 		lg.Error("agent invoke failed", slog.Any("err", err))
@@ -134,7 +144,7 @@ func (b *Bot) handle(parent context.Context, m *domain.InboundMessage) {
 		return
 	}
 
-	// Step 3: 回发
+	// 步骤 3：回发。
 	out := &domain.OutboundMessage{
 		Platform:  m.Platform,
 		ConvType:  m.ConvType,
@@ -147,7 +157,7 @@ func (b *Bot) handle(parent context.Context, m *domain.InboundMessage) {
 		return
 	}
 
-	// Step 4: 观测日志——被拦截的路径走 info 以便线上报警，正常路径降到 debug
+	// 步骤 4：观测日志——被拦截的路径走 info 以便线上报警，正常路径降到 debug
 	// 避免刷屏。
 	if state.Verdict.Blocked() {
 		lg.Info("reply sent (blocked path)",
@@ -158,16 +168,6 @@ func (b *Bot) handle(parent context.Context, m *domain.InboundMessage) {
 			slog.Int("len", len(state.Reply.Content)))
 	}
 
-	// Step 5: 异步 stats 打分。放在 Send 之后触发，保证主回复路径不承担
-	// 打分延迟；Dispatch 内部用独立 ctx，不受本函数 ctx 到期影响。
-	//
-	// 即便 state.Verdict.Blocked() 为真（挨了攻击走 fallback 回复）也照样
-	// 打分——用户骂人本来就该扣机器人心情，不跳过是为了让
-	// "挨骂→心情变差→后续回复更烦躁" 的反馈闭环成立。
-	if b.statsStore != nil && b.scoreModel != nil && m.UserID != "" {
-		stats.Dispatch(b.statsStore, b.scoreModel, b.logger,
-			string(m.Platform), m.UserID, m.Text, state.Reply.Content)
-	}
 }
 
 // decideReplyTarget 逐条决定本次回复要不要 @、要不要引用、或是什么都不加。

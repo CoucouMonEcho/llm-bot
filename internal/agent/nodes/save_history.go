@@ -1,8 +1,8 @@
 // Package nodes 的 save_history.go 实现"把本轮对话写回 Redis"的 Lambda 节点。
 //
-// 位置：postproc → saveHistory → END。
+// 位置：postproc → saveHistory → scoreStats → END。
 // 只有 "正常回复" 路径会走到这里——被 guard 判定为攻击的消息及其降级回复
-// 都通过 branch 直接跳到 fallback → END，从而天然地**不入历史**。
+// 都通过 branch 直接跳到 fallback → scoreStats → END，从而天然地**不入历史**。
 //
 // 写入内容：
 //   - 一条 user 消息（st.In.Query 原文，不做 wrapper 包装——wrapper 只是
@@ -33,7 +33,7 @@ func NewSaveHistory(repo store.HistoryRepo, historyMax int, logger *slog.Logger)
 			return st, nil
 		}
 
-		// Step 1: 写入用户消息（使用原始 Query，不是 wrapper 后的）。
+		// 第一步：写入用户消息（使用原始 Query，不是 wrapper 后的）。
 		userMsg := schema.UserMessage(st.In.Query)
 		if err := repo.Append(ctx, st.In.SessionID, userMsg, historyMax); err != nil {
 			lg.Warn("append user message failed",
@@ -42,7 +42,7 @@ func NewSaveHistory(repo store.HistoryRepo, historyMax int, logger *slog.Logger)
 			return st, nil // 不阻断回复发送
 		}
 
-		// Step 2: 写入 assistant 回复。
+		// 第二步：写入 assistant 回复。
 		if err := repo.Append(ctx, st.In.SessionID, st.Reply, historyMax); err != nil {
 			lg.Warn("append assistant message failed",
 				slog.String("session", st.In.SessionID),

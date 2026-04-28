@@ -1,8 +1,8 @@
 // Package guard 的 guarded_model.go 实现"主模型 Generate + LLM 裁判并行"的节点。
 //
 // 位置：buildMessages → guardedModel → (branch by Verdict)
-//   - Verdict 仍为 Safe → 走 postproc → saveHistory → END；
-//   - Verdict 被裁判置为 VerdictJudge → 走 fallback → END。
+//   - Verdict 仍为 Safe → 走 postproc → saveHistory → scoreStats → END；
+//   - Verdict 被裁判置为 VerdictJudge → 走 fallback → scoreStats → END。
 //
 // 为什么把"主模型调用 + 裁判并行"留在同一个节点而不是再拆两个：
 //   - eino Graph 原生 fan-out/fan-in 无法实现"兄弟分支中断"——只有我们自己

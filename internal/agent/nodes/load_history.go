@@ -1,6 +1,6 @@
 // Package nodes 的 load_history.go 实现"从 Redis 读取会话历史"的 Lambda 节点。
 //
-// 位置：regexGate(miss) → loadHistory → buildMessages → guardedModel。
+// 位置：prepareStats → loadHistory → buildMessages → guardedModel。
 //
 // 为什么独立成节点：
 //   - 历史读取是纯 IO，与消息组装、模型调用解耦，便于未来替换为别的存储
