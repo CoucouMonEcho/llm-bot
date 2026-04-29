@@ -50,6 +50,8 @@ type Blacklist struct {
 // 模型，不额外引入新的 LLM 配置段。
 type Stats struct {
 	Enabled bool `yaml:"enabled"`
+	// ScorePromptFile 是 stats 打分模型 system prompt 的 YAML 文件路径。
+	ScorePromptFile string `yaml:"score_prompt_file"`
 }
 
 // Proactive 控制主动发消息的静态策略。YAML 只保存部署期参数；
@@ -177,6 +179,8 @@ type Guard struct {
 	RegexPatterns []string `yaml:"regex_patterns"`
 	// JudgeEnabled 控制是否启用并行 LLM 裁判。关闭后仅保留正则 + prompt 包装两道防线。
 	JudgeEnabled bool `yaml:"judge_enabled"`
+	// JudgePromptFile 是 LLM 裁判 system prompt 的 YAML 文件路径。
+	JudgePromptFile string `yaml:"judge_prompt_file"`
 	// FallbackReplies 是降级回复的候选池，运行时随机挑选一条。
 	FallbackReplies []string `yaml:"fallback_replies"`
 }
@@ -266,6 +270,14 @@ func (c *Config) validate() error {
 	}
 	if c.Guard.JudgeEnabled && (c.Judge.BaseURL == "" || c.Judge.Model == "") {
 		return fmt.Errorf("config: judge.base_url and judge.model are required when guard.judge_enabled")
+	}
+	c.Guard.JudgePromptFile = strings.TrimSpace(c.Guard.JudgePromptFile)
+	if c.Guard.JudgeEnabled && c.Guard.JudgePromptFile == "" {
+		return fmt.Errorf("config: guard.judge_prompt_file is required when guard.judge_enabled")
+	}
+	c.Stats.ScorePromptFile = strings.TrimSpace(c.Stats.ScorePromptFile)
+	if c.Stats.Enabled && c.Stats.ScorePromptFile == "" {
+		return fmt.Errorf("config: stats.score_prompt_file is required when stats.enabled")
 	}
 	if c.Agent.PromptFile == "" {
 		return fmt.Errorf("config: agent.prompt_file is required")

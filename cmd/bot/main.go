@@ -4,8 +4,8 @@
 //  1. 解析命令行 flag 找到 config.yaml；
 //  2. 加载配置、构造 logger；
 //  3. 连 Redis，构造 HistoryRepo；
-//  4. 加载人设 YAML，构造 Persona；
-//  5. 构造 stats 资源（若启用）：stats.Store 与打分 ChatModel；
+//  4. 加载人设与裁判 prompt YAML；
+//  5. 构造 stats 资源（若启用）：stats.Store、打分 prompt 与打分 ChatModel；
 //  6. 构造 Agent Runnable（这一步会构造主/裁判 ChatModel、编译 Graph）；
 //  7. 构造主动消息资源（若启用）；
 //  8. 构造 OneBot Adapter；
@@ -26,6 +26,7 @@ import (
 	"github.com/cloudwego/eino/components/model"
 	"github.com/echo/llm-bot/internal/adapter/onebot"
 	"github.com/echo/llm-bot/internal/agent"
+	"github.com/echo/llm-bot/internal/agent/guard"
 	"github.com/echo/llm-bot/internal/bot"
 	"github.com/echo/llm-bot/internal/config"
 	"github.com/echo/llm-bot/internal/proactive"
@@ -70,18 +71,32 @@ func main() {
 		fatal("load persona: %v", err)
 	}
 
+	var judgePrompt string
+	if cfg.Guard.JudgeEnabled {
+		judgePrompt, err = guard.LoadJudgePrompt(cfg.Guard.JudgePromptFile)
+		if err != nil {
+			fatal("load judge prompt: %v", err)
+		}
+	}
+
 	// 步骤 5：构造 stats 资源（若启用）。
-	// 产出两件东西:
+	// 产出三件东西:
 	//   - statsStore：传给 agent.Build，用于 prepareStats 节点结算并读取参数快照；
+	//   - scorePrompt：传给 scoreStats 节点作为打分模型的 system prompt；
 	//   - scoreModel：传给 agent.Build，用于 scoreStats 节点在回复生成后异步打分。
 	// 打分模型复用 cfg.Judge——打分的负载特征（短 prompt、严格 JSON、低 QPS）
 	// 与 judge 接近，共享一份配置避免再引入一个 LLM 配置段。
 	//
-	// stats.enabled=false 时两者都保持 nil；agent graph 内部会安全处理 nil，
+	// stats.enabled=false 时这些资源都保持零值；agent graph 内部会安全处理 nil，
 	// main 这里无需塞哨兵对象。
 	var statsStore *stats.Store
 	var scoreModel model.BaseChatModel
+	var scorePrompt string
 	if cfg.Stats.Enabled {
+		scorePrompt, err = stats.LoadScorePrompt(cfg.Stats.ScorePromptFile)
+		if err != nil {
+			fatal("load stats score prompt: %v", err)
+		}
 		statsStore = stats.NewStore(redisCli, logger)
 		sm, err := agent.NewChatModel(ctx, cfg.Judge)
 		if err != nil {
@@ -93,11 +108,13 @@ func main() {
 
 	// 步骤 6：构造 Agent Runnable。
 	runnable, err := agent.Build(ctx, cfg, agent.Deps{
-		History:    historyRepo,
-		Persona:    persona,
-		Logger:     logger,
-		Stats:      statsStore,
-		ScoreModel: scoreModel,
+		History:     historyRepo,
+		Persona:     persona,
+		Logger:      logger,
+		Stats:       statsStore,
+		JudgePrompt: judgePrompt,
+		ScoreModel:  scoreModel,
+		ScorePrompt: scorePrompt,
 	})
 	if err != nil {
 		fatal("build agent: %v", err)

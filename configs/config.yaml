@@ -49,6 +49,7 @@ guard:
 
   # 第二级：LLM 裁判与主链并行跑；裁判判 attack 时 cancel 主链的 ctx。
   judge_enabled: true
+  judge_prompt_file: "configs/prompts/judge.yaml"
 
   # 攻击被命中时的降级回复模板，运行时随机挑选一条，避免被攻击者识别固定模式。
   fallback_replies:
@@ -76,6 +77,7 @@ log:
 # 写入 Redis。失败只打日志、不影响对话。
 stats:
   enabled: true
+  score_prompt_file: "configs/prompts/stats_score.yaml"
 
 # 主动发消息（静态策略）：运行期开关和群白名单保存在 Redis。
 # 默认关闭；即使打开 enabled，也建议先保持 dry_run 观察候选和限流行为。

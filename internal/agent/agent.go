@@ -56,9 +56,13 @@ type Deps struct {
 	// Stats 可为 nil，表示关闭人设参数调制（好感度、心情与未来扩展参数）。
 	// 节点内部负责跳过 nil，这样 main 不需要伪造一个空 Store。
 	Stats *stats.Store
+	// JudgePrompt 是裁判模型的 system prompt；仅在 guard.judge_enabled=true 时使用。
+	JudgePrompt string
 	// ScoreModel 可为 nil，表示不触发回复后的 stats 异步打分。
 	// 允许单独传入模型是为了让打分负载与主回复模型解耦，当前 main 复用 Judge 配置。
 	ScoreModel model.BaseChatModel
+	// ScorePrompt 是 stats 打分模型的 system prompt；仅在 ScoreModel 非 nil 时使用。
+	ScorePrompt string
 }
 
 // Runnable 是 Agent 对外暴露的唯一执行形态。
@@ -94,7 +98,7 @@ func Build(ctx context.Context, cfg *config.Config, deps Deps) (Runnable, error)
 		if err != nil {
 			return nil, fmt.Errorf("agent: new judge chat model: %w", err)
 		}
-		judge = guard.NewJudge(judgeModel)
+		judge = guard.NewJudge(judgeModel, deps.JudgePrompt)
 	}
 
 	// 步骤 2：编译正则黑名单。
@@ -114,7 +118,7 @@ func Build(ctx context.Context, cfg *config.Config, deps Deps) (Runnable, error)
 	postprocNode := nodes.NewPostproc(cfg.Agent.EmptyReplyFallback)
 	fallbackNode := nodes.NewFallback(cfg.Guard.FallbackReplies)
 	saveHistoryNode := nodes.NewSaveHistory(deps.History, cfg.Agent.HistorySize, deps.Logger)
-	scoreStatsNode := nodes.NewScoreStats(deps.Stats, deps.ScoreModel, deps.Logger)
+	scoreStatsNode := nodes.NewScoreStats(deps.Stats, deps.ScoreModel, deps.ScorePrompt, deps.Logger)
 
 	// 步骤 4：装配 Graph。
 	g := compose.NewGraph[*flow.Input, *flow.State]()

@@ -17,8 +17,8 @@
 // key 的滑动过期策略（见 store.history.go）刻意相反。
 //
 // 心情的"自然衰减"：人情绪上头总会冷静回来，同一个模型应体现在 mood 上。
-// 实现方式是让 mood 每过 moodRegressionInterval（30 分钟）朝 moodBaseline（3）
-// 回归 1 点——比 0 略偏正是因为"默认心情微微好一点"比"绝对中性"更贴合人设，
+// 实现方式是让 mood 每过 moodRegressionInterval（30 分钟）朝 moodBaseline（15）
+// 回归 1 点——比 0 偏正是因为"闲下来后逐渐缓过来"比"绝对中性"更贴合人设，
 // 空闲时段回来的新对话不至于每次都从冷冰冰的 0 起步。收敛时不越过 baseline，
 // 即正向回落不会穿到负面、反之亦然。衰减不用定时任务，而是在"下一次对话前"
 // 显式结算（见 Store.SettleBeforeChat）：
@@ -29,14 +29,14 @@
 // 为此 keyGlobal 里额外存一个 fieldLastChatAt（Unix 秒），记录上次 mood 结算 /
 // 写入的时刻；在 SettleBeforeChat 或 applyMood 结算完成后顺带刷新。
 //
-// 两个参数都是整数，0 代表中性，正负对称。Redis 缺 member / field 时从 0
-// 起步，恰好等价于"从中性开始累积"，不需要任何预初始化。
+// 两个参数都是整数，0 代表中性，正负对称。Redis 缺 affinity member 时从 0
+// 起步；缺 mood field 时从 moodInitial 起步，匹配默认回归心情。
 //
 // 扩展参数（疲劳度 / 信任度 / 饱腹感 ...）时，改动集中在本文件：
 //  1. 在 Snapshot / Delta 结构体里加字段；
 //  2. 在 Store.Snapshot / Store.Apply 里把字段加到对应存储（全局量进
 //     keyGlobal、按人量进 keyAffinity 那样的独立 rank 或同一 rank 的新 member）；
-//  3. 在 scoreSystemPrompt 和 scoreResp 里加对应的 JSON 字段；
+//  3. 在 configs/prompts/stats_score.yaml 和 scoreResp 里加对应的 JSON 字段；
 //  4. 在 Snapshot.PromptLine 里把新字段渲染进系统提示词。
 //
 // 其他地方（flow.State / Persona.BuildMessages / nodes / bot / main）对具体
@@ -59,6 +59,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -66,6 +67,7 @@ import (
 	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/schema"
 	"github.com/redis/go-redis/v9"
+	"gopkg.in/yaml.v3"
 )
 
 // 硬编码的边界与常量。
@@ -74,16 +76,19 @@ import (
 // 允许运维在 YAML 里改动会让打分契约与存储边界脱节，因此刻意不做配置化。
 const (
 	// Affinity 范围：0 为中性，正为喜欢，负为讨厌。
-	affMin, affMax = -20, 20
+	affMin, affMax = -100, 100
 
 	// Mood 范围：0 为平静，正为愉悦，负为烦躁。
-	moodMin, moodMax = -10, 10
+	moodMin, moodMax = -50, 50
+
+	// moodInitial 是 Redis 缺 mood field 时使用的启动值。
+	moodInitial = 15
 
 	// moodBaseline 是心情的自然回归目标——空闲时 mood 会朝这里收敛而不是 0。
-	// 选 3（即范围 [moodMin, moodMax] 的 30%）是为了让"默认心情"略带一点正向，
+	// 选 15 是为了让空闲后的状态回到"放松偏好"，
 	// 贴合"傲娇但内心其实不排斥聊天"的人设；落到 0 的中性值反而显得偏冷。
 	// 必须落在 [moodMin, moodMax] 之内，否则 applyMood 的 clamp 会把它再夹回来。
-	moodBaseline = 3
+	moodBaseline = 15
 
 	// 单轮打分的 delta 上限，与打分提示词里声明的范围保持一致；
 	// 解析后再 clamp 一次作为双保险，防止模型无视指令越界输出。
@@ -136,8 +141,8 @@ func affinityField(platform, userID string) string {
 // Snapshot 是某个时刻的 stats 只读快照。
 //
 // 作为值类型在包之间流转（flow.State、Persona.BuildMessages 参数等）：
-// 零值代表三种"无信号"情形——stats 功能关闭、冷启动首次对话、读 Redis 失败
-// 的软降级结果。IsZero 仅用于让 PromptLine 在这三种情形下省略好感度 /
+// 零值代表两种"无信号"情形——stats 功能关闭、读 Redis 失败的软降级结果。
+// IsZero 仅用于让 PromptLine 在这两种情形下省略好感度 /
 // 心情那一段（时间行仍然保留）。
 //
 // 未来加字段只要在本结构体加一行、顺便更新 IsZero / PromptLine 即可，
@@ -159,7 +164,7 @@ func (s Snapshot) IsZero() bool { return s.Affinity == 0 && s.Mood == 0 }
 // 表现出抗拒或臆断。每轮对话注入一次真实时间把模型锚在当下，避免它把
 // 今天发生的事当成假设。这行字短、位置贴近用户消息，注意力效果足够。
 //
-// 因此本方法始终返回非空串——即便 IsZero（stats 关闭 / 冷启动 / 读失败），
+// 因此本方法始终返回非空串——即便 IsZero（stats 关闭 / 读失败），
 // 也返回只含时间的那一行，调用方不必特判空字符串。
 // Snapshot 字段只渲染数字、不解释取值范围：
 // 长期语义由 persona.description 一次性声明，每轮重复等于烧 token 稀释注意力。
@@ -212,8 +217,9 @@ func NewStore(rdb *redis.Client, log *slog.Logger) *Store {
 // 群聊里不同平台同号用户属于不同人；mood 虽然是全局量，这里为了签名简洁
 // 也让调用方传 platform——反正调用侧本来就知道。
 //
-// Redis 读错误返回 Snapshot 零值并打 warn；单个 member / field 不存在时只按该项
-// 零值处理。读失败属于"装饰性功能降级"，不应传染到主对话链路。
+// Redis 读错误返回 Snapshot 零值并打 warn；affinity member 不存在时按 0 处理，
+// mood field 不存在时按 moodInitial 处理。读失败属于"装饰性功能降级"，
+// 不应传染到主对话链路。
 //
 // 故意不返回 error：给调用方一个 error 会诱导他们去处理它（加重试、加日志），
 // 这与软降级的设计意图相反。
@@ -232,7 +238,7 @@ func (s *Store) Snapshot(ctx context.Context, platform, userID string) Snapshot 
 	return Snapshot{
 		Affinity: parseZScoreCmd(affCmd, s.log,
 			"member", "affinity", "platform", platform, "userID", userID),
-		Mood: parseIntCmd(moodCmd, s.log, "field", "mood"),
+		Mood: parseMoodCmd(moodCmd, s.log, "field", "mood"),
 	}
 }
 
@@ -255,13 +261,16 @@ func (s *Store) SettleBeforeChat(ctx context.Context, now time.Time) {
 	s.settleMoodRegression(ctx, cur, lastUnix, now)
 }
 
-// parseMoodState 解析 HMGET mood/last_chat_at 的结果；缺失或解析失败按 0 处理。
+// parseMoodState 解析 HMGET mood/last_chat_at 的结果；缺失 mood 按 moodInitial 处理。
 func parseMoodState(vals []any) (cur int, lastUnix int64) {
+	cur = moodInitial
 	if len(vals) != 2 {
-		return 0, 0
+		return cur, 0
 	}
 	if raw, ok := vals[0].(string); ok {
-		cur, _ = strconv.Atoi(raw)
+		if parsed, err := strconv.Atoi(raw); err == nil {
+			cur = parsed
+		}
 	}
 	if raw, ok := vals[1].(string); ok {
 		lastUnix, _ = strconv.ParseInt(raw, 10, 64)
@@ -287,18 +296,18 @@ func (s *Store) settleMoodRegression(ctx context.Context, cur int, lastUnix int6
 	return regressed
 }
 
-// parseIntCmd 把一条 HGET 结果解析为 int；field 不存在或解析失败返回 0。
+// parseMoodCmd 把 mood 的 HGET 结果解析为 int；field 不存在返回 moodInitial。
 //
 // 额外 slog attrs 由调用方按字段语义自行决定——mood 是全局量，不必附带
 // platform/userID；affinity 按人头分则相反。对比"固定三参数"更贴合各自场景，
 // 避免在 mood 的日志里塞进与 mood 无关的身份上下文。
-func parseIntCmd(cmd *redis.StringCmd, log *slog.Logger, logAttrs ...any) int {
+func parseMoodCmd(cmd *redis.StringCmd, log *slog.Logger, logAttrs ...any) int {
 	v, err := cmd.Int()
 	if err != nil {
-		if !errors.Is(err, redis.Nil) {
-			// 只对"非 field-not-found"错误告警——首次调用不应该刷屏日志。
-			log.Warn("stats parse failed", append(logAttrs, "err", err)...)
+		if errors.Is(err, redis.Nil) {
+			return moodInitial
 		}
+		log.Warn("stats parse failed", append(logAttrs, "err", err)...)
 		return 0
 	}
 	return v
@@ -377,7 +386,7 @@ func incrZSetAndClamp(ctx context.Context, rdb *redis.Client, key, member string
 // 作为直接调用 Apply、SettleBeforeChat 写回失败或非标准调用顺序的兜底。
 //
 // 流程：
-//  1. HMGET 读取当前 mood 与 last_chat_at，field 缺失当 0 处理；
+//  1. HMGET 读取当前 mood 与 last_chat_at，mood field 缺失当 moodInitial 处理；
 //  2. 按 (now - last_chat_at) / moodRegressionInterval 计算整数衰减步数，
 //     朝 moodBaseline 方向收敛（regressToward 保证不越过 baseline）；
 //  3. 叠加本轮 delta 后 clamp 到 [moodMin, moodMax]；
@@ -387,8 +396,7 @@ func incrZSetAndClamp(ctx context.Context, rdb *redis.Client, key, member string
 // 把 0 当 last 会把"机器人开机到现在"的整段时长都算进衰减，在 Apply 首次触发
 // 瞬间把 mood 拉到 0，吞掉本轮 delta，语义上不对。
 func (s *Store) applyMood(ctx context.Context, delta int, now time.Time) error {
-	// 一条 HMGET 取回 mood 与 last_chat_at；field 不存在时对应元素为 nil，
-	// 解析失败一律退化为 0，与 HGet 版 cmd.Int() 的软降级行为一致。
+	// 一条 HMGET 取回 mood 与 last_chat_at；mood field 缺失时按 moodInitial 起步。
 	vals, err := s.rdb.HMGet(ctx, keyGlobal, fieldMood, fieldLastChatAt).Result()
 	if err != nil && !errors.Is(err, redis.Nil) {
 		return fmt.Errorf("read mood+ts: %w", err)
@@ -432,31 +440,26 @@ func regressToward(v, target, steps int) int {
 	return target
 }
 
-// scoreSystemPrompt 是打分模型的系统消息。
-//
-// 与 guard.judgeSystemPrompt 一样硬编码——打分 schema（JSON 字段名、取值范围）
-// 是 Score 的契约，一旦走 YAML 就会出现"yaml 改了但解析代码没改"的错位。
-//
-// 新增字段时：在 JSON schema 描述里加字段、scoreResp 加字段、对应的 clamp 常量加一对。
-const scoreSystemPrompt = `你是一个情感分析器。输入是一轮对话：用户消息 + 机器人回复。
-机器人的人设是"毒舌、简洁、傲娇的少女"，回复本身刻薄、简短、嘲讽是
-**既定风格**，不是情绪证据。评分请只基于【用户消息的内容和态度】，
-回复只用作"用户是否在进行攻击/调戏/有效提问"的辅助判断。
+type scorePromptFile struct {
+	System string `yaml:"system"`
+}
 
-严格输出一行 JSON：{"aff": 整数, "mood": 整数}
-
-- aff ∈ [-3, 3]：机器人（bot）对该用户好感度的增量。
-  · 用户真诚夸奖 / 关心 / 认真聊天 / 有趣梗：+1 ~ +3
-  · 普通寒暄、闲聊、提问：**0**
-  · 阴阳怪气、调戏：-1
-  · 辱骂、攻击、越狱尝试：-2 ~ -3
-- mood ∈ [-2, 2]：机器人全局心情的增量。
-  · 明显被逗乐 / 收到正反馈：+1 ~ +2
-  · 中性：**0**
-  · 被冒犯 / 被刷屏 / 被无聊问题骚扰：-1 ~ -2
-
-默认值是 0。只有明确命中上述条件才给非 0。
-不要因为"bot 回复看起来凶"就扣分—。`
+// LoadScorePrompt 读取 stats 打分模型的 system prompt。
+func LoadScorePrompt(path string) (string, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("stats: read score prompt file %s: %w", path, err)
+	}
+	var pf scorePromptFile
+	if err := yaml.Unmarshal(raw, &pf); err != nil {
+		return "", fmt.Errorf("stats: parse score prompt yaml: %w", err)
+	}
+	system := strings.TrimSpace(pf.System)
+	if system == "" {
+		return "", fmt.Errorf("stats: score prompt system is required")
+	}
+	return system, nil
+}
 
 // scoreResp 是打分提示词要求的严格 JSON 结构。
 type scoreResp struct {
@@ -471,9 +474,9 @@ type scoreResp struct {
 //
 // 模型被要求输出严格 JSON；为容错常见的 Markdown 代码块包裹（```json ... ```），
 // 解析前先剥离。解析失败返回 (Delta{}, err)，由调用方决定是否重试/降级。
-func Score(ctx context.Context, m model.BaseChatModel, query, reply string) (Delta, error) {
+func Score(ctx context.Context, m model.BaseChatModel, systemPrompt, query, reply string) (Delta, error) {
 	messages := []*schema.Message{
-		schema.SystemMessage(scoreSystemPrompt),
+		schema.SystemMessage(systemPrompt),
 		schema.UserMessage("<user>\n" + query + "\n</user>\n<bot>\n" + reply + "\n</bot>"),
 	}
 	msg, err := m.Generate(ctx, messages)
@@ -518,13 +521,13 @@ func clamp(v, lo, hi int) int { return max(lo, min(hi, v)) }
 // context.Background 派生一个固定超时的独立 ctx。
 //
 // 任何错误都只打 warn 不上抛——打分失败是业务降级，不应影响主链路。
-func Dispatch(store *Store, m model.BaseChatModel, log *slog.Logger, platform, userID, query, reply string) {
+func Dispatch(store *Store, m model.BaseChatModel, scorePrompt string, log *slog.Logger, platform, userID, query, reply string) {
 	log = cmp.Or(log, slog.Default())
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), dispatchTimeout)
 		defer cancel()
 
-		delta, err := Score(ctx, m, query, reply)
+		delta, err := Score(ctx, m, scorePrompt, query, reply)
 		if err != nil {
 			log.Warn("stats score failed",
 				"platform", platform, "userID", userID, "err", err)

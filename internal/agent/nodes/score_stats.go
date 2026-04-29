@@ -29,7 +29,7 @@ import (
 // 这里不复用调用方 ctx：Dispatch 内部会创建独立超时上下文，避免 Bot 在发送
 // 完回复后取消请求 ctx，顺手把异步打分也取消掉。反过来，打分慢或失败也不能
 // 拖住 Graph 收尾，所以本节点只做触发，不把结果写回 State。
-func NewScoreStats(store *stats.Store, scoreModel model.BaseChatModel, logger *slog.Logger) *compose.Lambda {
+func NewScoreStats(store *stats.Store, scoreModel model.BaseChatModel, scorePrompt string, logger *slog.Logger) *compose.Lambda {
 	return compose.InvokableLambda(func(_ context.Context, st *flow.State) (*flow.State, error) {
 		if store == nil || scoreModel == nil {
 			return st, nil
@@ -40,7 +40,7 @@ func NewScoreStats(store *stats.Store, scoreModel model.BaseChatModel, logger *s
 		if st.Reply == nil || st.Reply.Content == "" {
 			return st, nil
 		}
-		stats.Dispatch(store, scoreModel, logger,
+		stats.Dispatch(store, scoreModel, scorePrompt, logger,
 			st.In.Platform, st.In.UserID, st.In.Query, st.Reply.Content)
 		return st, nil
 	})
