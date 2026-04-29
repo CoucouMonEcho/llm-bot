@@ -19,6 +19,12 @@ import (
 // postTypeMessage 是 OneBot 普通聊天消息事件的 post_type 值。
 const postTypeMessage = "message"
 
+// emptyTriggerPlaceholder 是"@bot 但正文为空"时塞给 Agent 的占位文本。
+// 括号 + 第三人称叙述让 LLM 把它读成元事件而非字面用户输入；
+// "但什么也没说"显式关掉 LLM 脑补具体内容的可能；
+// 不复用"戳了戳"是为了给将来真正的 OneBot poke 事件留出命名空间。
+const emptyTriggerPlaceholder = "（艾特了你 但什么也没说）"
+
 // rawEvent 是 OneBot v11 消息事件的最小公共子集解码结构。
 // 为了避免全字段建模，未用到的字段一律以 json.RawMessage 承载。
 type rawEvent struct {
@@ -61,6 +67,7 @@ type messageSegment struct {
 //  4. 根据配置的 trigger 规则判断"该不该理"——
 //     4.1 私聊：按 trigger.Private 决定；
 //     4.2 群聊：先剥离 @bot 段，随后按 trigger.GroupAtOnly 与 prefix 决定；
+//     触发命中但正文为空时会用 emptyTriggerPlaceholder 代替，避免静默丢弃；
 //  5. 构建 InboundMessage，其中 Text 字段是**已经剥离触发标记后**的纯净文本。
 func decodeAndFilter(raw []byte, selfID int64, tr config.Trigger, blacklist config.Blacklist) (*domain.InboundMessage, error) {
 	var ev rawEvent
@@ -84,6 +91,7 @@ func decodeAndFilter(raw []byte, selfID int64, tr config.Trigger, blacklist conf
 	}
 
 	// Step 4: 按会话类型与配置做触发过滤。
+	groupTriggered := false
 	switch ev.MessageType {
 	case "private":
 		if !tr.Private {
@@ -93,12 +101,12 @@ func decodeAndFilter(raw []byte, selfID int64, tr config.Trigger, blacklist conf
 		// 群聊触发条件：@bot 或 以任一前缀开头（二者任一满足）。
 		var prefixMatched bool
 		plainText, prefixMatched = matchPrefix(plainText, tr.Prefix)
-		matched := atSelf || prefixMatched
-		if !matched {
+		if !atSelf && !prefixMatched {
 			// 无论 GroupAtOnly 是否开启，没命中前缀/@ 时都不触发——
 			// 群内闲聊若全部触发会被洗版。
 			return nil, nil
 		}
+		groupTriggered = true
 	default:
 		// 其他消息类型（比如 discuss 已弃用）一律忽略。
 		return nil, nil
@@ -106,7 +114,14 @@ func decodeAndFilter(raw []byte, selfID int64, tr config.Trigger, blacklist conf
 
 	plainText = strings.TrimSpace(plainText)
 	if plainText == "" {
-		return nil, nil
+		if !groupTriggered {
+			// 私聊里发来的纯空白消息：罕见，静默忽略。
+			return nil, nil
+		}
+		// 群聊 @ / 前缀已命中但正文为空（典型"只点了 @ 没打字"），
+		// 是用户的明确意图，不该静默丢弃。塞一个元事件占位符让 Agent
+		// 按人设自然反问；保持 Adapter 的"业务无感"——不在这里写死回复文案。
+		plainText = emptyTriggerPlaceholder
 	}
 
 	// Step 5: 组装 InboundMessage。
