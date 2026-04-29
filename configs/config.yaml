@@ -79,6 +79,13 @@ stats:
   enabled: true
   score_prompt_file: "configs/prompts/stats_score.yaml"
 
+# 长期用户记忆：按"平台 + 用户"保存压缩事实摘要，让机器人隔一段时间仍然记得人。
+# 更新模型复用 judge 配置，异步执行，失败只打日志不影响本轮回复。
+memory:
+  enabled: true
+  update_prompt_file: "configs/prompts/memory_update.yaml"
+  max_chars: 1200
+
 # 主动发消息（静态策略）：运行期开关和群白名单保存在 Redis。
 # 默认关闭；即使打开 enabled，也建议先保持 dry_run 观察候选和限流行为。
 proactive:
@@ -93,6 +100,5 @@ proactive:
   top_n: 50                           # 好感度榜单最多扫描人数
   daily_limit: 3                      # 每日主动发送上限
   session_cooldown_sec: 21600         # 同一 session 冷却 6h
-  pending_ttl_sec: 1800               # 主动消息短上下文保留 30m
   recent_events_cap: 200              # 白名单群聊最近事件列表上限
   dry_run: true

@@ -1,8 +1,8 @@
 // Package guard 的 guarded_model.go 实现"主模型 Generate + LLM 裁判并行"的节点。
 //
-// 位置：buildMessages → guardedModel → (branch by Verdict)
-//   - Verdict 仍为 Safe → 走 postproc → saveHistory → scoreStats → END；
-//   - Verdict 被裁判置为 VerdictJudge → 走 fallback → scoreStats → END。
+// 位置：buildMessages → guardedModel → (branch by VerdictKind)
+//   - VerdictKind 仍为 Safe → 走 postproc → saveHistory → scoreStats → END；
+//   - VerdictKind 被裁判置为 VerdictJudge → 走 fallback → scoreStats → END。
 //
 // 为什么把"主模型调用 + 裁判并行"留在同一个节点而不是再拆两个：
 //   - eino Graph 原生 fan-out/fan-in 无法实现"兄弟分支中断"——只有我们自己
@@ -12,7 +12,7 @@
 //     "Messages → Reply"，并发与 cancel 是实现细节，不污染 Graph 拓扑。
 //
 // 本节点的输入已是 state.Messages（buildMessages 组装好的完整消息列表），
-// 产出 state.Reply 或把 state.Verdict 设为 VerdictJudge。Persona / History
+// 产出 state.Reply 或把 state.VerdictKind 设为 VerdictJudge。Persona / History
 // 的组装在上游节点完成，本节点只消费 Messages——职责边界清晰，方便单测。
 package guard
 
@@ -116,7 +116,7 @@ func NewGuardedModel(mainModel model.BaseChatModel, judge *Judge, logger *slog.L
 		// 按裁判结论产出 State。
 		// -----------------------------------------------------------
 		if attack {
-			st.Verdict = flow.Verdict{Kind: flow.VerdictJudge}
+			st.VerdictKind = flow.VerdictJudge
 			lg.Info("judge blocked", slog.String("session", st.In.SessionID))
 			return st, nil
 		}

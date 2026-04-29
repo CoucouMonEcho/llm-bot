@@ -3,8 +3,9 @@
 // Build 负责：
 //  1. 构造主模型 / 裁判模型；
 //  2. 编译正则黑名单、构造 Judge；
-//  3. 把 regexGate / prepareStats / loadHistory / buildMessages / guardedModel /
-//     postproc / saveHistory / fallback / scoreStats 九个节点装配成 compose.Graph
+//  3. 把 regexGate / prepareStats / loadMemory / loadHistory / buildMessages /
+//     guardedModel / postproc / saveHistory / updateMemory / fallback / scoreStats
+//     十一个节点装配成 compose.Graph
 //     并编译为 Runnable；
 //  4. 返回 Runnable 给 Bot 主循环。
 //
@@ -16,7 +17,7 @@
 //	regexGate ── (命中) ──► fallback ────────────────┐
 //	  │ (未命中)
 //	  ▼
-//	prepareStats ──► loadHistory ──► buildMessages ──► guardedModel
+//	prepareStats ──► loadMemory ──► loadHistory ──► buildMessages ──► guardedModel
 //	                                                   │
 //	                                      攻击 ────────┴──────── 放行
 //	                                      │                        │
@@ -27,7 +28,7 @@
 //	                                                 │        saveHistory
 //	                                                 │             │
 //	                                                 ▼             ▼
-//	                                             scoreStats ◄──────┘
+//	                                             scoreStats ◄── updateMemory ◄──┘
 //	                                                 │
 //	                                                 ▼
 //	                                                END
@@ -44,6 +45,7 @@ import (
 	"github.com/echo/llm-bot/internal/agent/guard"
 	"github.com/echo/llm-bot/internal/agent/nodes"
 	"github.com/echo/llm-bot/internal/config"
+	"github.com/echo/llm-bot/internal/memory"
 	"github.com/echo/llm-bot/internal/stats"
 	"github.com/echo/llm-bot/internal/store"
 )
@@ -56,6 +58,8 @@ type Deps struct {
 	// Stats 可为 nil，表示关闭人设参数调制（好感度、心情与未来扩展参数）。
 	// 节点内部负责跳过 nil，这样 main 不需要伪造一个空 Store。
 	Stats *stats.Store
+	// Memory 可为 nil，表示关闭长期用户记忆注入与更新。
+	Memory *memory.Store
 	// JudgePrompt 是裁判模型的 system prompt；仅在 guard.judge_enabled=true 时使用。
 	JudgePrompt string
 	// ScoreModel 可为 nil，表示不触发回复后的 stats 异步打分。
@@ -63,6 +67,10 @@ type Deps struct {
 	ScoreModel model.BaseChatModel
 	// ScorePrompt 是 stats 打分模型的 system prompt；仅在 ScoreModel 非 nil 时使用。
 	ScorePrompt string
+	// MemoryModel 可为 nil，表示不触发回复后的长期记忆异步更新。
+	MemoryModel model.BaseChatModel
+	// MemoryPrompt 是长期记忆更新模型的 system prompt；仅在 MemoryModel 非 nil 时使用。
+	MemoryPrompt string
 }
 
 // Runnable 是 Agent 对外暴露的唯一执行形态。
@@ -73,12 +81,14 @@ type Runnable = compose.Runnable[*flow.Input, *flow.State]
 const (
 	nodeRegexGate     = "regexGate"
 	nodePrepareStats  = "prepareStats"
+	nodeLoadMemory    = "loadMemory"
 	nodeLoadHistory   = "loadHistory"
 	nodeBuildMessages = "buildMessages"
 	nodeGuardedModel  = "guardedModel"
 	nodePostproc      = "postproc"
 	nodeFallback      = "fallback"
 	nodeSaveHistory   = "saveHistory"
+	nodeUpdateMemory  = "updateMemory"
 	nodeScoreStats    = "scoreStats"
 )
 
@@ -112,12 +122,14 @@ func Build(ctx context.Context, cfg *config.Config, deps Deps) (Runnable, error)
 	// 反向依赖 agent 包（会形成 import 环）。
 	regexGateNode := guard.NewRegexGate(regex, deps.Logger)
 	prepareStatsNode := nodes.NewPrepareStats(deps.Stats)
+	loadMemoryNode := nodes.NewLoadMemory(deps.Memory, cfg.Memory.MaxChars, deps.Logger)
 	loadHistoryNode := nodes.NewLoadHistory(deps.History, cfg.Agent.HistorySize, deps.Logger)
 	buildMessagesNode := nodes.NewBuildMessages(deps.Persona.BuildMessages)
 	guardedModelNode := guard.NewGuardedModel(mainModel, judge, deps.Logger)
 	postprocNode := nodes.NewPostproc(cfg.Agent.EmptyReplyFallback)
 	fallbackNode := nodes.NewFallback(cfg.Guard.FallbackReplies)
 	saveHistoryNode := nodes.NewSaveHistory(deps.History, cfg.Agent.HistorySize, deps.Logger)
+	updateMemoryNode := nodes.NewUpdateMemory(deps.Memory, deps.MemoryModel, deps.MemoryPrompt, cfg.Memory.MaxChars, deps.Logger)
 	scoreStatsNode := nodes.NewScoreStats(deps.Stats, deps.ScoreModel, deps.ScorePrompt, deps.Logger)
 
 	// 步骤 4：装配 Graph。
@@ -129,12 +141,14 @@ func Build(ctx context.Context, cfg *config.Config, deps Deps) (Runnable, error)
 	}{
 		{nodeRegexGate, regexGateNode},
 		{nodePrepareStats, prepareStatsNode},
+		{nodeLoadMemory, loadMemoryNode},
 		{nodeLoadHistory, loadHistoryNode},
 		{nodeBuildMessages, buildMessagesNode},
 		{nodeGuardedModel, guardedModelNode},
 		{nodePostproc, postprocNode},
 		{nodeFallback, fallbackNode},
 		{nodeSaveHistory, saveHistoryNode},
+		{nodeUpdateMemory, updateMemoryNode},
 		{nodeScoreStats, scoreStatsNode},
 	} {
 		if err := g.AddLambdaNode(add.key, add.lambda); err != nil {
@@ -147,11 +161,13 @@ func Build(ctx context.Context, cfg *config.Config, deps Deps) (Runnable, error)
 	// 攻击消息不入历史但仍触发回复后打分"是 graph 的显式结构而非副作用。
 	edges := []struct{ from, to string }{
 		{compose.START, nodeRegexGate},
-		{nodePrepareStats, nodeLoadHistory},
+		{nodePrepareStats, nodeLoadMemory},
+		{nodeLoadMemory, nodeLoadHistory},
 		{nodeLoadHistory, nodeBuildMessages},
 		{nodeBuildMessages, nodeGuardedModel},
 		{nodePostproc, nodeSaveHistory},
-		{nodeSaveHistory, nodeScoreStats},
+		{nodeSaveHistory, nodeUpdateMemory},
+		{nodeUpdateMemory, nodeScoreStats},
 		{nodeFallback, nodeScoreStats},
 		{nodeScoreStats, compose.END},
 	}
@@ -164,7 +180,7 @@ func Build(ctx context.Context, cfg *config.Config, deps Deps) (Runnable, error)
 	// regexGate 根据同步正则结果路由：放行进入 prepareStats，命中进入 fallback。
 	regexBranch := compose.NewGraphBranch(
 		func(_ context.Context, st *flow.State) (string, error) {
-			if st.Verdict.Blocked() {
+			if st.VerdictKind != flow.VerdictSafe {
 				return nodeFallback, nil
 			}
 			return nodePrepareStats, nil
@@ -181,7 +197,7 @@ func Build(ctx context.Context, cfg *config.Config, deps Deps) (Runnable, error)
 	// guardedModel 根据裁判结果路由：放行进入 postproc，攻击进入 fallback。
 	verdictBranch := compose.NewGraphBranch(
 		func(_ context.Context, st *flow.State) (string, error) {
-			if st.Verdict.Blocked() {
+			if st.VerdictKind != flow.VerdictSafe {
 				return nodeFallback, nil
 			}
 			return nodePostproc, nil
@@ -206,7 +222,9 @@ func Build(ctx context.Context, cfg *config.Config, deps Deps) (Runnable, error)
 		slog.Int("regex_count", len(cfg.Guard.RegexPatterns)),
 		slog.Int("history_size", cfg.Agent.HistorySize),
 		slog.Bool("stats_enabled", deps.Stats != nil),
-		slog.Bool("stats_scoring_enabled", deps.Stats != nil && deps.ScoreModel != nil))
+		slog.Bool("stats_scoring_enabled", deps.Stats != nil && deps.ScoreModel != nil),
+		slog.Bool("memory_enabled", deps.Memory != nil),
+		slog.Bool("memory_update_enabled", deps.Memory != nil && deps.MemoryModel != nil))
 
 	return runnable, nil
 }

@@ -1,7 +1,8 @@
 // Package proactive 的 selector.go 实现主动消息候选选择。
 //
-// 策略分两层：先从 stats 好感度排行里找近期活跃且可触达的用户；没有合适目标时，
-// 再从白名单群近期活动里挑一个可发送会话。选择失败返回 nil，不代表系统错误。
+// 策略分两层：先通过 stats.Store.TopUsers 读好感度排行，找近期活跃且可触达的
+// 用户；没有合适目标时，再从白名单群近期活动里挑一个可发送会话。选择失败返回
+// nil，不代表系统错误。
 package proactive
 
 import (
@@ -13,62 +14,8 @@ import (
 	"time"
 
 	"github.com/echo/llm-bot/internal/domain"
+	"github.com/echo/llm-bot/internal/stats"
 )
-
-const (
-	// 默认只看好感度前 50，避免每轮调度扫完整个排行。
-	defaultAffinityTopN = 50
-	// 用户刚说完不立刻主动打扰，沉寂太久也不贸然唤起。
-	defaultMinSince = time.Hour
-	defaultMaxSince = 6 * time.Hour
-	// 群活动兜底只扫描最近一小段，和记录器侧列表上限配合使用。
-	defaultRecentScan = 100
-	// 默认不额外加会话冷却，由调度间隔和日限额先兜住发送频率。
-	defaultCooldownSlack = 0
-)
-
-// SelectorConfig 控制主动消息候选的选择范围与冷却规则。
-//
-// MinSince/MaxSince 只约束好感度用户的最近主动发言时间；RecentEventScan 服务群活动
-// 兜底策略；SessionCooldown 对两类候选都生效。
-type SelectorConfig struct {
-	AffinityTopN    int
-	MinSince        time.Duration
-	MaxSince        time.Duration
-	RecentEventScan int
-	SessionCooldown time.Duration
-}
-
-// DefaultSelectorConfig 返回当前阶段保守的候选选择默认值。
-//
-// 默认值偏向“少打扰”：只触达一到六小时内出现过的人，且优先复用已有好感度信号。
-func DefaultSelectorConfig() SelectorConfig {
-	return SelectorConfig{
-		AffinityTopN:    defaultAffinityTopN,
-		MinSince:        defaultMinSince,
-		MaxSince:        defaultMaxSince,
-		RecentEventScan: defaultRecentScan,
-		SessionCooldown: defaultCooldownSlack,
-	}
-}
-
-// withDefaults 补齐未配置字段；SessionCooldown 允许 0，表示不启用额外冷却。
-func (c SelectorConfig) withDefaults() SelectorConfig {
-	d := DefaultSelectorConfig()
-	if c.AffinityTopN <= 0 {
-		c.AffinityTopN = d.AffinityTopN
-	}
-	if c.MinSince <= 0 {
-		c.MinSince = d.MinSince
-	}
-	if c.MaxSince <= 0 {
-		c.MaxSince = d.MaxSince
-	}
-	if c.RecentEventScan <= 0 {
-		c.RecentEventScan = d.RecentEventScan
-	}
-	return c
-}
 
 // CandidateSource 标记候选来自哪一路选择策略。
 //
@@ -104,17 +51,29 @@ type Candidate struct {
 // 第一阶段优先从好感度用户回找可触达会话；失败后再看白名单群的近期活动。
 // 某一路 Redis 读取失败会被记录并尽量尝试下一路，避免主动功能的局部故障放大。
 type Selector struct {
-	state *State
-	log   *slog.Logger
-	cfg   SelectorConfig
+	state        *State
+	stats        *stats.Store
+	log          *slog.Logger
+	affinityTopN int
+	minSinceLast time.Duration
+	maxSinceLast time.Duration
+	recentScan   int
+	cooldown     time.Duration
 }
 
 // NewSelector 构造基于 Redis 状态的候选选择器。
-func NewSelector(state *State, log *slog.Logger, cfg SelectorConfig) *Selector {
+//
+// statsStore 提供好感度排行；为 nil 时第一阶段会立即 fall through 到群活动兜底。
+func NewSelector(state *State, statsStore *stats.Store, log *slog.Logger, cfg Config) *Selector {
 	return &Selector{
-		state: state,
-		log:   cmp.Or(log, slog.Default()),
-		cfg:   cfg.withDefaults(),
+		state:        state,
+		stats:        statsStore,
+		log:          cmp.Or(log, slog.Default()),
+		affinityTopN: cfg.AffinityTopN,
+		minSinceLast: cfg.MinSinceLast,
+		maxSinceLast: cfg.MaxSinceLast,
+		recentScan:   cfg.RecentEventScan,
+		cooldown:     cfg.SessionCooldown,
 	}
 }
 
@@ -135,7 +94,10 @@ func (s *Selector) Select(ctx context.Context, now time.Time) (*Candidate, error
 
 // selectByAffinity 从好感度排行挑用户，再反查这个用户最近出现过的可发送会话。
 func (s *Selector) selectByAffinity(ctx context.Context, now time.Time) (*Candidate, error) {
-	entries, err := s.state.TopAffinity(ctx, s.cfg.AffinityTopN)
+	if s.stats == nil {
+		return nil, nil
+	}
+	entries, err := s.stats.TopUsers(ctx, s.affinityTopN)
 	if err != nil {
 		return nil, err
 	}
@@ -143,18 +105,19 @@ func (s *Selector) selectByAffinity(ctx context.Context, now time.Time) (*Candid
 		if entry.Score <= 0 {
 			continue
 		}
+		platform := domain.Platform(entry.Platform)
 		// 好感度只决定“优先看谁”，还必须满足最近主动发言时间窗。
-		lastInbound, ok, err := s.state.UserLastInbound(ctx, entry.Platform, entry.UserID)
+		lastInbound, ok, err := s.state.UserLastInbound(ctx, platform, entry.UserID)
 		if err != nil {
 			s.log.Warn("proactive last inbound read failed",
 				"platform", entry.Platform, "userID", entry.UserID, "err", err)
 			continue
 		}
-		if !ok || !withinLastInboundWindow(lastInbound, now, s.cfg.MinSince, s.cfg.MaxSince) {
+		if !ok || !withinLastInboundWindow(lastInbound, now, s.minSinceLast, s.maxSinceLast) {
 			continue
 		}
 
-		sessions, err := s.state.UserSessions(ctx, entry.Platform, entry.UserID)
+		sessions, err := s.state.UserSessions(ctx, platform, entry.UserID)
 		if err != nil {
 			s.log.Warn("proactive user sessions read failed",
 				"platform", entry.Platform, "userID", entry.UserID, "err", err)
@@ -181,7 +144,7 @@ func (s *Selector) selectByAffinity(ctx context.Context, now time.Time) (*Candid
 
 // selectByRecentGroup 从白名单群近期活动中挑一个不在冷却期的群。
 func (s *Selector) selectByRecentGroup(ctx context.Context, now time.Time) (*Candidate, error) {
-	events, err := s.state.RecentGroupEvents(ctx, s.cfg.RecentEventScan)
+	events, err := s.state.RecentGroupEvents(ctx, s.recentScan)
 	if err != nil {
 		return nil, err
 	}
@@ -255,14 +218,14 @@ func (s *Selector) sessionEligibility(ctx context.Context, sessions []SessionMet
 
 // sessionInCooldown 判断会话是否仍在主动发送冷却期内。
 func (s *Selector) sessionInCooldown(ctx context.Context, session SessionMeta, now time.Time) (bool, error) {
-	if s.cfg.SessionCooldown <= 0 {
+	if s.cooldown <= 0 {
 		return false, nil
 	}
 	last, ok, err := s.state.LastProactiveAt(ctx, session.Platform, session.SessionID)
 	if err != nil || !ok {
 		return false, err
 	}
-	return now.Sub(last) < s.cfg.SessionCooldown, nil
+	return now.Sub(last) < s.cooldown, nil
 }
 
 // withinLastInboundWindow 判断用户最近活跃是否落在“适合主动打扰”的时间窗内。

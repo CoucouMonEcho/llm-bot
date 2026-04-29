@@ -2,7 +2,7 @@
 //
 // 独立成包的理由：
 //   - agent 顶层会导入 guard 与 nodes 来装配 Graph；
-//   - guard 与 nodes 需要共享 Input / State / Verdict 定义；
+//   - guard 与 nodes 需要共享 Input / State / VerdictKind 定义；
 //   - 若把这些类型放在 agent 顶层，guard / nodes 导入 agent 会形成循环；
 //   - 因此提取为一个"叶子包"，agent / guard / nodes 都单向依赖 flow。
 //
@@ -11,7 +11,6 @@ package flow
 
 import (
 	"github.com/cloudwego/eino/schema"
-	"github.com/echo/llm-bot/internal/stats"
 )
 
 // Input 是从 Bot 主循环喂进 Graph 的入参。
@@ -42,6 +41,10 @@ type Input struct {
 
 // VerdictKind 是一次防护判定的种类。零值 VerdictSafe 代表"未被任何防线拦截"，
 // 这使得 State 零值即等价于"放行"，Graph 的起始节点无需显式初始化。
+//
+// 拦截理由的细节（命中的 pattern、裁判输出等）由产生它的节点当场打日志，
+// 不再随 State 流转——细节只对当时排查的人有用，外化成字段反而会让 Graph
+// 上下游需要一起维护"何时填空、何时为空"的约定。
 type VerdictKind int
 
 const (
@@ -53,32 +56,9 @@ const (
 	VerdictJudge
 )
 
-// Verdict 是一次防护判定的完整值对象。
-//
-// 把"是否拦截"与"为什么拦截"聚合成一个值类型而不是 bool + 两个 string 的组合：
-//   - Kind 是分支决策的唯一依据，Detail 仅用于日志；二者的耦合集中在一处，
-//     新增一种拦截原因时只需要加一个枚举并填 Detail，不会出现"三字段修改漏一个"
-//     的逻辑不自洽；
-//   - 值类型（非指针）让零值等价于 Safe——State 起始即放行、拷贝即隔离，
-//     调用方不必写任何 nil 判断或显式初始化；
-//   - Detail 的含义由 Kind 决定（见下），避免了"空字符串是未检测还是无命中"
-//     这种模糊。
-type Verdict struct {
-	// Kind 判定种类。仅此字段参与分支决策。
-	Kind VerdictKind
-	// Detail 判定的附加信息，仅用于日志：
-	//   - Kind==VerdictRegex 时存命中的正则 pattern 原文；
-	//   - Kind==VerdictJudge 时可选地保留裁判的原始输出；
-	//   - Kind==VerdictSafe 时为空。
-	Detail string
-}
-
-// Blocked 当前判定是否要走降级分支。Graph 的 verdict branch 用它做路由。
-func (v Verdict) Blocked() bool { return v.Kind != VerdictSafe }
-
 // String 返回 Kind 的稳定字符串，便于日志检索。
-func (v Verdict) String() string {
-	switch v.Kind {
+func (k VerdictKind) String() string {
+	switch k {
 	case VerdictSafe:
 		return "safe"
 	case VerdictRegex:
@@ -113,15 +93,24 @@ type State struct {
 	// 主链正常返回或 fallback 节点生成后填充。
 	Reply *schema.Message
 
-	// Verdict 聚合了"是否拦截"与"为什么拦截"。
-	// 零值即 VerdictSafe，表示一路放行。
-	Verdict Verdict
+	// VerdictKind 是本轮防护判定的种类。
+	// 零值即 VerdictSafe，表示一路放行；非零意味着 Graph 应路由到 fallback。
+	VerdictKind VerdictKind
 
-	// Stats 是本轮对话开始时的人设参数快照（当前含好感度 + 心情，可扩展）。
-	// 由 prepareStats 节点在装配系统提示词之前填入；若 stats 功能关闭或
-	// UserID 缺失则保持零值 Snapshot{}，此时 PromptLine 只渲染当前时间一行，
-	// 好感度 / 心情段省略。Graph 其余部分对具体字段无感知。
-	Stats stats.Snapshot
+	// Affinity / Mood 是本轮对话开始时 stats 快照的平铺字段。
+	// 由 prepareStats 节点在装配系统提示词之前填入；若 stats 功能关闭、读取
+	// 失败或 UserID 缺失，两者均保持零值——下游按"无信号"处理（具体语义仍
+	// 在 stats 包定义，零值即 stats.Snapshot.IsZero() 的状态）。
+	//
+	// 平铺成 int 而不是嵌入 stats.Snapshot：让 flow 包不再依赖 stats（stats
+	// 还会反向引用 flow 之外的能力），buildMessages 等节点也只搬运标量。
+	Affinity int
+	Mood     int
+
+	// Memory 是本轮对话开始时读取到的长期用户事实摘要。
+	// 它按"平台 + 用户"维度存储，和会话历史分离：history 负责最近发生的逐条对话，
+	// Memory 负责跨会话保留高度压缩的偏好、近况与雷区。为空表示无可用记忆。
+	Memory string
 }
 
 // NewState 便捷构造器：以 Input 初始化 State，其余字段按零值处理。

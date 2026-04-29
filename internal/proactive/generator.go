@@ -18,73 +18,44 @@ import (
 	"github.com/echo/llm-bot/internal/store"
 )
 
-// GeneratorConfig 控制主动开场白生成时可读取的上下文量。
-//
-// 历史只用于模仿当前会话语气，不允许模型引用或总结；因此默认读取很少几条。
-type GeneratorConfig struct {
-	// HistorySize 表示传给模型的同会话历史条数，只用于语气参考。
-	// 0 使用默认值，负数表示不读取历史。
-	HistorySize int
-	// MaxHistoryChars 限制写入提示词的历史文本长度。
-	MaxHistoryChars int
-}
-
-// DefaultGeneratorConfig 返回较保守的生成默认值。
-//
-// 历史条数和字符数都偏小，优先降低串场和泄露上下文的风险。
-func DefaultGeneratorConfig() GeneratorConfig {
-	return GeneratorConfig{
-		HistorySize:     6,
-		MaxHistoryChars: 1200,
-	}
-}
-
-// withDefaults 补齐生成配置；HistorySize 负数表示显式关闭历史读取。
-func (c GeneratorConfig) withDefaults() GeneratorConfig {
-	d := DefaultGeneratorConfig()
-	if c.HistorySize == 0 {
-		c.HistorySize = d.HistorySize
-	}
-	if c.MaxHistoryChars <= 0 {
-		c.MaxHistoryChars = d.MaxHistoryChars
-	}
-	return c
-}
-
 // GeneratorOptions 汇总 Generator 的模型、历史仓库和配置。
 //
-// History 可以为 nil，此时生成器只根据候选元信息写开场白。
+// History 可以为 nil，此时生成器只根据候选元信息写开场白。Config 复用扁平的
+// proactive.Config，Generator 自己只读其中两个字段。
 type GeneratorOptions struct {
 	Model   model.BaseChatModel
 	History store.HistoryRepo
 	Logger  *slog.Logger
-	Config  GeneratorConfig
+	Config  Config
 	Prompts GeneratorPrompts
 }
 
 // Generator 负责生成短主动消息。
 //
 // 它只读取同一会话历史作为语气参考，不写入长期历史；真正发送和状态写入由
-// Scheduler 完成。
+// Scheduler 完成。历史只用于模仿当前会话语气，不允许模型引用或总结；因此默
+// 认读取很少几条。historySize 为负数时显式跳过历史读取。
 type Generator struct {
-	model      model.BaseChatModel
-	history    store.HistoryRepo
-	log        *slog.Logger
-	cfg        GeneratorConfig
-	prompts    GeneratorPrompts
-	promptsErr error
+	model           model.BaseChatModel
+	history         store.HistoryRepo
+	log             *slog.Logger
+	historySize     int
+	maxHistoryChars int
+	prompts         GeneratorPrompts
 }
 
 // NewGenerator 构造主动消息生成器。
+//
+// opts.Prompts 应该来自 LoadGeneratorPrompts，已经过 normalized 校验；
+// 这里不再做二次兜底，避免装配期问题被静默压到运行期。
 func NewGenerator(opts GeneratorOptions) *Generator {
-	prompts, promptsErr := opts.Prompts.normalized()
 	return &Generator{
-		model:      opts.Model,
-		history:    opts.History,
-		log:        cmp.Or(opts.Logger, slog.Default()),
-		cfg:        opts.Config.withDefaults(),
-		prompts:    prompts,
-		promptsErr: promptsErr,
+		model:           opts.Model,
+		history:         opts.History,
+		log:             cmp.Or(opts.Logger, slog.Default()),
+		historySize:     opts.Config.HistorySize,
+		maxHistoryChars: opts.Config.MaxHistoryChars,
+		prompts:         opts.Prompts,
 	}
 }
 
@@ -99,9 +70,6 @@ func (g *Generator) Generate(ctx context.Context, cand Candidate, now time.Time)
 	if cand.Platform == "" || cand.ConvType == "" || cand.SessionID == "" {
 		return "", fmt.Errorf("proactive: incomplete candidate")
 	}
-	if g.promptsErr != nil {
-		return "", fmt.Errorf("proactive: generator prompts: %w", g.promptsErr)
-	}
 
 	history, err := g.loadHistory(ctx, cand.SessionID)
 	if err != nil {
@@ -109,7 +77,7 @@ func (g *Generator) Generate(ctx context.Context, cand Candidate, now time.Time)
 	}
 	messages := []*schema.Message{
 		schema.SystemMessage(g.prompts.System),
-		schema.UserMessage(buildGeneratorPrompt(g.prompts, cand, now, history, g.cfg.MaxHistoryChars)),
+		schema.UserMessage(buildGeneratorPrompt(g.prompts, cand, now, history, g.maxHistoryChars)),
 	}
 	reply, err := g.model.Generate(ctx, messages)
 	if err != nil {
@@ -122,12 +90,12 @@ func (g *Generator) Generate(ctx context.Context, cand Candidate, now time.Time)
 	return text, nil
 }
 
-// loadHistory 读取同会话最近历史；HistorySize < 0 时显式跳过。
+// loadHistory 读取同会话最近历史；historySize < 0 时显式跳过。
 func (g *Generator) loadHistory(ctx context.Context, sessionID string) ([]*schema.Message, error) {
-	if g.history == nil || g.cfg.HistorySize < 0 {
+	if g.history == nil || g.historySize < 0 {
 		return nil, nil
 	}
-	msgs, err := g.history.Load(ctx, sessionID, g.cfg.HistorySize)
+	msgs, err := g.history.Load(ctx, sessionID, g.historySize)
 	if err != nil {
 		return nil, fmt.Errorf("proactive: load history: %w", err)
 	}

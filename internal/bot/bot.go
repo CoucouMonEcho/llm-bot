@@ -17,6 +17,7 @@ import (
 	"github.com/echo/llm-bot/internal/agent"
 	"github.com/echo/llm-bot/internal/agent/flow"
 	"github.com/echo/llm-bot/internal/domain"
+	"github.com/echo/llm-bot/internal/proactive"
 )
 
 // maxConcurrent 单进程同时处理的最大消息数。
@@ -29,41 +30,27 @@ const replyTimeout = 60 * time.Second
 
 const sendDeadlineReserve = 300 * time.Millisecond
 
-type replyLengthTier int
-
-const (
-	replyTierShort replyLengthTier = iota
-	replyTierMedium
-	replyTierLong
-)
-
 // Bot 聚合 Adapter 与 Runnable，是整个服务的"大主循环"载体。
+//
+// activityRecorder 直接持有 *proactive.ActivityRecorder：proactive 关闭时
+// main 传 nil 进来，handle 中的 nil-check 会跳过；这条旁路记录的具体写入
+// 行为（Redis key、白名单、软降级）都收敛在 proactive 包里。
 type Bot struct {
 	adapter  adapter.Adapter
 	runnable agent.Runnable
 	logger   *slog.Logger
 
-	activityRecorder ActivityRecorder
+	activityRecorder *proactive.ActivityRecorder
 
 	sem chan struct{} // 并发信号量
-}
-
-// ActivityRecorder 是 Bot 写入主动消息候选索引所需的最小接口。
-//
-// Bot 只知道"真实入站消息刚发生"，不应该知道主动消息如何按好感度排序、
-// 如何写 Redis key、如何读运行期开关。因此这里收敛成一个无返回值接口：
-// 实现侧负责软降级和日志，记录失败不能中断主回复链路，也不能迫使 bot 包
-// 反向依赖 proactive 包。
-type ActivityRecorder interface {
-	// RecordInbound 记录一条真实入站消息，用于后续主动消息候选选择、冷却判断和短上下文拼接。
-	RecordInbound(ctx context.Context, msg *domain.InboundMessage)
 }
 
 // New 构造一个 Bot。
 //
 // ad 可以是任何满足 adapter.Adapter 的实现；rn 是 agent.Build 的返回值。
-// stats 打分由 Agent Graph 的 scoreStats 节点在"回复已生成"时触发，Bot 只负责发送。
-func New(ad adapter.Adapter, rn agent.Runnable, recorder ActivityRecorder, logger *slog.Logger) *Bot {
+// recorder 为 nil 表示主动消息功能关闭。stats 打分由 Agent Graph 的
+// scoreStats 节点在"回复已生成"时触发，Bot 只负责发送。
+func New(ad adapter.Adapter, rn agent.Runnable, recorder *proactive.ActivityRecorder, logger *slog.Logger) *Bot {
 	return &Bot{
 		adapter:          ad,
 		runnable:         rn,
@@ -157,8 +144,8 @@ func (b *Bot) handle(parent context.Context, m *domain.InboundMessage) {
 		return
 	}
 
-	tier := classifyReplyLength(state.Reply.Content)
-	if err := waitBeforeSend(ctx, receivedAt, targetReplyLatency(tier)); err != nil {
+	runeCount := utf8.RuneCountInString(strings.TrimSpace(state.Reply.Content))
+	if err := waitBeforeSend(ctx, receivedAt, targetReplyLatency(runeCount)); err != nil {
 		lg.Warn("reply delayed until context done", slog.Any("err", err))
 		return
 	}
@@ -169,7 +156,7 @@ func (b *Bot) handle(parent context.Context, m *domain.InboundMessage) {
 		ConvType:  m.ConvType,
 		SessionID: m.SessionID,
 		Text:      state.Reply.Content,
-		ReplyTo:   decideReplyTarget(m, tier),
+		ReplyTo:   decideReplyTarget(m, runeCount),
 	}
 	if err := b.adapter.Send(ctx, out); err != nil {
 		lg.Error("adapter send failed", slog.Any("err", err))
@@ -177,11 +164,11 @@ func (b *Bot) handle(parent context.Context, m *domain.InboundMessage) {
 	}
 
 	// 步骤 4：观测日志——被拦截的路径走 info 以便线上报警，正常路径降到 debug
-	// 避免刷屏。
-	if state.Verdict.Blocked() {
+	// 避免刷屏。被拦截的具体细节（命中的 pattern、裁判输出）由产生它的节点
+	// 当场打日志，这里只标记"走的是哪一类拦截"。
+	if state.VerdictKind != flow.VerdictSafe {
 		lg.Info("reply sent (blocked path)",
-			slog.String("verdict", state.Verdict.String()),
-			slog.String("detail", state.Verdict.Detail))
+			slog.String("verdict", state.VerdictKind.String()))
 	} else {
 		lg.Debug("reply sent",
 			slog.Int("len", len(state.Reply.Content)))
@@ -189,28 +176,17 @@ func (b *Bot) handle(parent context.Context, m *domain.InboundMessage) {
 
 }
 
-// classifyReplyLength 用 rune 数而不是字节数衡量文本量，中文和 emoji 都能稳定分档。
-func classifyReplyLength(text string) replyLengthTier {
-	n := utf8.RuneCountInString(strings.TrimSpace(text))
-	switch {
-	case n <= 12:
-		return replyTierShort
-	case n <= 35:
-		return replyTierMedium
-	default:
-		return replyTierLong
-	}
-}
-
 // targetReplyLatency 是从收到消息到发出回复的目标总耗时。
 //
-// 这些数值比常见移动端/中文输入速度更快，但能避免 LLM 生成很快时出现"秒回长文"
-// 的机器感。若模型调用本身已经超过目标耗时，waitBeforeSend 不会再额外等待。
-func targetReplyLatency(tier replyLengthTier) time.Duration {
-	switch tier {
-	case replyTierShort:
+// 用 rune 数（而非字节数）衡量文本量，中文和 emoji 都能稳定分档。两个阈值
+// 12 / 35 划分短 / 中 / 长三档；这些数值比常见移动端/中文输入速度更快，但能
+// 避免 LLM 生成很快时出现"秒回长文"的机器感。若模型调用本身已经超过目标
+// 耗时，waitBeforeSend 不会再额外等待。
+func targetReplyLatency(runeCount int) time.Duration {
+	switch {
+	case runeCount <= 12:
 		return 1200 * time.Millisecond
-	case replyTierMedium:
+	case runeCount <= 35:
 		return 3500 * time.Millisecond
 	default:
 		return 6500 * time.Millisecond
@@ -255,19 +231,19 @@ func waitBeforeSend(ctx context.Context, receivedAt time.Time, targetTotal time.
 //
 // 任何新增策略都应当只改本函数的实现，避免把开关在全局配置里四处蔓延。
 //
-// 当前策略：
+// 当前策略（按 rune 数 12 / 35 划分长度档位）：
 //   - 私聊：无需指向，返回 nil；
-//   - 群聊短回复：直接发送，不 @，降低轻量回复的打扰感；
+//   - 群聊短回复（≤12）：直接发送，不 @，降低轻量回复的打扰感；
 //   - 群聊中等回复：@ 发信人；
-//   - 群聊长回复：优先引用原消息，缺少 MessageID 时降级为 @。
-func decideReplyTarget(m *domain.InboundMessage, tier replyLengthTier) *domain.ReplyTarget {
+//   - 群聊长回复（>35）：优先引用原消息，缺少 MessageID 时降级为 @。
+func decideReplyTarget(m *domain.InboundMessage, runeCount int) *domain.ReplyTarget {
 	if m == nil || m.ConvType != domain.ConversationGroup {
 		return nil
 	}
-	if tier == replyTierShort {
+	if runeCount <= 12 {
 		return nil
 	}
-	if tier == replyTierLong && m.MessageID != "" {
+	if runeCount > 35 && m.MessageID != "" {
 		return &domain.ReplyTarget{
 			Mode:      domain.ReplyModeQuote,
 			MessageID: m.MessageID,

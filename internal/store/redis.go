@@ -1,9 +1,9 @@
 // Package store 封装本项目对 Redis 的所有访问。
 //
 // 设计约束：
-//  1. 仅存储对话历史，不存储用户资料、配额、会话状态等——这些在 MVP 阶段
-//     都不需要。等真的有需求时再新增 Repository。
-//  2. 所有 Redis key 都通过 keyHistory 等函数生成，禁止在业务代码里手写 key，
+//  1. 历史、长期记忆、stats 与主动消息各自通过窄 Repository / Store 访问 Redis；
+//     不把业务读写散落到调用方。
+//  2. 所有 Redis key 都通过各自包内函数生成，禁止在业务代码里手写 key，
 //     以便未来统一迁移 / rename。
 //  3. 本包只暴露 interface（见 history.go），底层结构体不外泄。
 package store

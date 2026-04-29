@@ -79,7 +79,7 @@ func NewJudge(m model.BaseChatModel, systemPrompt string) *Judge {
 //     裁判不可用时默认放行，由其他防线兜底。
 //
 // 选择 bool 而非枚举：Judge 语义上只有二元结论，一个 bool 足矣；
-// 同时也避免了与 flow.Verdict 值类型的命名冲突。
+// 拦截种类由调用节点写入 flow.State.VerdictKind。
 func (j *Judge) Classify(ctx context.Context, input string) (attack bool, err error) {
 	messages := []*schema.Message{
 		schema.SystemMessage(j.systemPrompt),

@@ -21,12 +21,14 @@ import (
 
 const (
 	// Redis key 约定：
-	//   - 运行期开关必须和配置开关同时打开才会真正发送；
-	//   - 群白名单控制哪些群允许被主动唤起；
+	//   - 运行期开关由外部运维写入，本包只读；
+	//   - 群白名单同样由外部写入，本包只读；
 	//   - 用户/会话索引用于从好感度用户回找可触达会话；
 	//   - 近期群活动只记录白名单群的入站消息，供兜底策略挑选；
-	//   - 最近主动发送时间和日计数负责冷却、日限额；
-	//   - PendingContext 保存刚主动发出的短期上下文，供下一条用户回复承接。
+	//   - 最近主动发送时间和日计数负责冷却、日限额。
+	//
+	// 好感度排行不在本包维护：通过 stats.Store.TopUsers 读取 stats 模块的 ZSET，
+	// 避免两个包同时拥有好感度语义。
 	keyEnabled           = "bot_proactive_enabled"
 	keyGroupWhitelist    = "bot_proactive_group_whitelist"
 	keyUserLastInbound   = "bot_proactive_user_last_inbound"
@@ -35,12 +37,7 @@ const (
 
 	keyUserSessionsPrefix = "bot_proactive_user_sessions_"
 	keySessionMetaPrefix  = "bot_proactive_session_meta_"
-	keyPendingPrefix      = "bot_proactive_pending_"
 	keyDailyCountPrefix   = "bot_proactive_daily_count_"
-
-	// stats 模块维护的好感度排行是主动选择的事实来源；proactive 只读不写，
-	// 避免两个包同时拥有好感度语义。
-	keyAffinityRank = "bot_stats_affinity_rank"
 
 	// 近期群活动只保留最近一小段，避免 Redis List 随群聊流量无限增长。
 	defaultRecentGroupEventCap = 200
@@ -48,8 +45,6 @@ const (
 	sessionMetaTTL = 30 * 24 * time.Hour
 	// 日计数横跨本地日期边界保留两天，给跨零点调度留出读取余量。
 	dailyCountTTL = 48 * time.Hour
-	// PendingContext 只服务“刚被主动喊完后的下一轮承接”，不应长期污染上下文。
-	defaultPendingTTL = 30 * time.Minute
 )
 
 // State 封装主动消息用到的 Redis key 与命令形态。
@@ -86,36 +81,6 @@ func (s *State) Enabled(ctx context.Context) (bool, error) {
 	return enabled, nil
 }
 
-// SetEnabled 更新运行期开关。
-//
-// key 不设置 TTL，避免 Redis 里开关意外过期后从“已开启”悄悄退回关闭状态。
-func (s *State) SetEnabled(ctx context.Context, enabled bool) error {
-	if err := s.rdb.Set(ctx, keyEnabled, strconv.FormatBool(enabled), 0).Err(); err != nil {
-		return fmt.Errorf("proactive: set enabled: %w", err)
-	}
-	return nil
-}
-
-// SetGroupWhitelisted 把群会话加入或移出运行期白名单。
-//
-// 只允许白名单群被主动唤起；私聊不走这层限制，而是依赖用户最近活动和会话冷却。
-func (s *State) SetGroupWhitelisted(ctx context.Context, groupSessionID string, allowed bool) error {
-	groupSessionID = normalizeGroupSessionID(groupSessionID)
-	if groupSessionID == "" {
-		return fmt.Errorf("proactive: empty group session id")
-	}
-	if allowed {
-		if err := s.rdb.SAdd(ctx, keyGroupWhitelist, groupSessionID).Err(); err != nil {
-			return fmt.Errorf("proactive: whitelist group: %w", err)
-		}
-		return nil
-	}
-	if err := s.rdb.SRem(ctx, keyGroupWhitelist, groupSessionID).Err(); err != nil {
-		return fmt.Errorf("proactive: unwhitelist group: %w", err)
-	}
-	return nil
-}
-
 // GroupWhitelisted 判断群会话是否在运行期白名单里。
 func (s *State) GroupWhitelisted(ctx context.Context, groupSessionID string) (bool, error) {
 	groupSessionID = normalizeGroupSessionID(groupSessionID)
@@ -127,17 +92,6 @@ func (s *State) GroupWhitelisted(ctx context.Context, groupSessionID string) (bo
 		return false, fmt.Errorf("proactive: check group whitelist: %w", err)
 	}
 	return ok, nil
-}
-
-// WhitelistedGroups 返回当前允许主动唤起的群会话 ID。
-//
-// 返回值主要供管理命令展示，不参与选择流程里的强一致判断。
-func (s *State) WhitelistedGroups(ctx context.Context) ([]string, error) {
-	groups, err := s.rdb.SMembers(ctx, keyGroupWhitelist).Result()
-	if err != nil {
-		return nil, fmt.Errorf("proactive: list group whitelist: %w", err)
-	}
-	return groups, nil
 }
 
 // RecordUserLastInbound 记录用户最近一次主动发言时间。
@@ -337,43 +291,6 @@ func (s *State) RecentGroupEvents(ctx context.Context, limit int) ([]RecentGroup
 	return events, nil
 }
 
-// AffinityEntry 是 stats 好感度排行 ZSET 中的一行。
-//
-// Score 保留 float64 是为了贴近 Redis ZSET 原始结果；选择策略只关心正负和排序。
-type AffinityEntry struct {
-	Platform domain.Platform
-	UserID   string
-	Score    float64
-}
-
-// TopAffinity 从 stats 排行中读取好感度最高的一批用户。
-//
-// member 解析失败会被跳过并告警，兼容 stats key 里可能存在的历史脏数据。
-func (s *State) TopAffinity(ctx context.Context, n int) ([]AffinityEntry, error) {
-	if n <= 0 {
-		return nil, nil
-	}
-	rows, err := s.rdb.ZRevRangeWithScores(ctx, keyAffinityRank, 0, int64(n-1)).Result()
-	if err != nil {
-		return nil, fmt.Errorf("proactive: read affinity rank: %w", err)
-	}
-	out := make([]AffinityEntry, 0, len(rows))
-	for _, row := range rows {
-		member := fmt.Sprint(row.Member)
-		platform, userID, ok := splitUserKey(member)
-		if !ok || userID == "" {
-			s.log.Warn("proactive affinity member skipped", "member", member)
-			continue
-		}
-		out = append(out, AffinityEntry{
-			Platform: platform,
-			UserID:   userID,
-			Score:    row.Score,
-		})
-	}
-	return out, nil
-}
-
 // LastProactiveAt 读取会话最近一次主动发送时间，用于冷却判断。
 //
 // 未命中返回 ok=false，由选择器按“没有冷却记录”处理。
@@ -434,68 +351,6 @@ func (s *State) IncrementDailyCount(ctx context.Context, day time.Time) (int64, 
 	return incr.Val(), nil
 }
 
-// PendingContext 保存刚主动发出的短期上下文。
-//
-// 下一条用户回复命中同一会话时，可以据此知道机器人刚刚主动说过什么；TTL 到期后
-// 自动失效，避免把一次主动开场长期当成当前话题。
-type PendingContext struct {
-	Platform      domain.Platform         `json:"platform"`
-	ConvType      domain.ConversationType `json:"conv_type"`
-	SessionID     string                  `json:"session_id"`
-	UserID        string                  `json:"user_id,omitempty"`
-	Source        CandidateSource         `json:"source"`
-	Text          string                  `json:"text"`
-	CreatedAtUnix int64                   `json:"created_at_unix"`
-}
-
-// SetPendingContext 写入短 TTL 上下文，只服务下一轮可能的用户承接。
-//
-// 只有真实发送成功后才应调用；DryRun 不写 PendingContext，避免伪造对话状态。
-func (s *State) SetPendingContext(ctx context.Context, pending PendingContext, ttl time.Duration) error {
-	if pending.Platform == "" || pending.SessionID == "" {
-		return fmt.Errorf("proactive: incomplete pending context")
-	}
-	if ttl <= 0 {
-		ttl = defaultPendingTTL
-	}
-	data, err := json.Marshal(pending)
-	if err != nil {
-		return fmt.Errorf("proactive: marshal pending context: %w", err)
-	}
-	if err := s.rdb.Set(ctx, keyPendingPrefix+makeSessionRef(pending.Platform, pending.SessionID), data, ttl).Err(); err != nil {
-		return fmt.Errorf("proactive: set pending context: %w", err)
-	}
-	return nil
-}
-
-// PendingContext 读取会话里的短期主动上下文。
-//
-// 缺失返回 ok=false，调用方可直接走普通入站处理。
-func (s *State) PendingContext(ctx context.Context, platform domain.Platform, sessionID string) (PendingContext, bool, error) {
-	raw, err := s.rdb.Get(ctx, keyPendingPrefix+makeSessionRef(platform, sessionID)).Result()
-	if errors.Is(err, redis.Nil) {
-		return PendingContext{}, false, nil
-	}
-	if err != nil {
-		return PendingContext{}, false, fmt.Errorf("proactive: read pending context: %w", err)
-	}
-	var pending PendingContext
-	if err := json.Unmarshal([]byte(raw), &pending); err != nil {
-		return PendingContext{}, false, fmt.Errorf("proactive: parse pending context: %w", err)
-	}
-	return pending, true, nil
-}
-
-// ClearPendingContext 清理会话里的短期主动上下文。
-//
-// 用户已经承接或主动上下文被消费后应清理，避免下一条无关消息误接上旧话题。
-func (s *State) ClearPendingContext(ctx context.Context, platform domain.Platform, sessionID string) error {
-	if err := s.rdb.Del(ctx, keyPendingPrefix+makeSessionRef(platform, sessionID)).Err(); err != nil {
-		return fmt.Errorf("proactive: clear pending context: %w", err)
-	}
-	return nil
-}
-
 // keyDailyCount 用本地日期生成日限额 key；调用方负责传入同一时区的 now。
 func keyDailyCount(day time.Time) string {
 	return keyDailyCountPrefix + day.Format("20060102")
@@ -508,15 +363,6 @@ func makeUserKey(platform domain.Platform, userID string) string {
 		p = "unknown"
 	}
 	return p + "_" + userID
-}
-
-// splitUserKey 解析 stats 好感度排行 member；格式不符时让调用方跳过。
-func splitUserKey(key string) (domain.Platform, string, bool) {
-	platform, userID, ok := strings.Cut(key, "_")
-	if !ok || platform == "" || userID == "" {
-		return "", "", false
-	}
-	return domain.Platform(platform), userID, true
 }
 
 // makeSessionRef 给会话元数据构造跨平台引用，分隔符避开 user key 的下划线格式。

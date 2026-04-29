@@ -31,6 +31,7 @@ type Config struct {
 	Blacklist Blacklist `yaml:"blacklist"`
 	Log       Log       `yaml:"log"`
 	Stats     Stats     `yaml:"stats"`
+	Memory    Memory    `yaml:"memory"`
 	Proactive Proactive `yaml:"proactive"`
 }
 
@@ -52,6 +53,19 @@ type Stats struct {
 	Enabled bool `yaml:"enabled"`
 	// ScorePromptFile 是 stats 打分模型 system prompt 的 YAML 文件路径。
 	ScorePromptFile string `yaml:"score_prompt_file"`
+}
+
+// Memory 控制长期用户记忆功能。
+//
+// Enabled=false 时，agent 不读写用户记忆，系统提示词里也不会出现长期记忆块。
+// Enabled=true 时复用 cfg.Judge 的 LLM 做回复后的异步摘要更新；Redis 中只保存
+// 一段按"平台 + 用户"维度压缩后的事实文本。
+type Memory struct {
+	Enabled bool `yaml:"enabled"`
+	// UpdatePromptFile 是长期记忆更新模型 system prompt 的 YAML 文件路径。
+	UpdatePromptFile string `yaml:"update_prompt_file"`
+	// MaxChars 限制注入和保存的长期记忆最大字符数。
+	MaxChars int `yaml:"max_chars"`
 }
 
 // Proactive 控制主动发消息的静态策略。YAML 只保存部署期参数；
@@ -83,8 +97,6 @@ type Proactive struct {
 	DailyLimit int `yaml:"daily_limit"`
 	// SessionCooldownSec 限制同一会话的主动发送频率。
 	SessionCooldownSec int `yaml:"session_cooldown_sec"`
-	// PendingTTLSec 是主动消息短上下文的保留时长，用于接住用户对主动消息的回复。
-	PendingTTLSec int `yaml:"pending_ttl_sec"`
 	// RecentEventsCap 限制每个会话记录的近期事件数量，控制候选选择时的 Redis 成本。
 	RecentEventsCap int `yaml:"recent_events_cap"`
 	// DryRun 只生成和记录决策，不真正发送；用于上线前观察候选质量。
@@ -114,11 +126,6 @@ func (p Proactive) JitterMax() time.Duration {
 // SessionCooldown 返回同一 session 的主动发送冷却时间。
 func (p Proactive) SessionCooldown() time.Duration {
 	return seconds(p.SessionCooldownSec)
-}
-
-// PendingTTL 返回主动消息短上下文的保留时长。
-func (p Proactive) PendingTTL() time.Duration {
-	return seconds(p.PendingTTLSec)
 }
 
 // Server 描述对外提供的 HTTP / WebSocket 服务。
@@ -221,6 +228,7 @@ func Load(path string) (*Config, error) {
 
 	cfg := Config{
 		Proactive: defaultProactive(),
+		Memory:    defaultMemory(),
 	}
 	if err := yaml.Unmarshal(raw, &cfg); err != nil {
 		return nil, fmt.Errorf("config: unmarshal %s: %w", path, err)
@@ -268,8 +276,8 @@ func (c *Config) validate() error {
 	if c.LLM.BaseURL == "" || c.LLM.Model == "" {
 		return fmt.Errorf("config: llm.base_url and llm.model are required")
 	}
-	if c.Guard.JudgeEnabled && (c.Judge.BaseURL == "" || c.Judge.Model == "") {
-		return fmt.Errorf("config: judge.base_url and judge.model are required when guard.judge_enabled")
+	if (c.Guard.JudgeEnabled || c.Stats.Enabled || c.Memory.Enabled) && (c.Judge.BaseURL == "" || c.Judge.Model == "") {
+		return fmt.Errorf("config: judge.base_url and judge.model are required when guard/stats/memory uses judge model")
 	}
 	c.Guard.JudgePromptFile = strings.TrimSpace(c.Guard.JudgePromptFile)
 	if c.Guard.JudgeEnabled && c.Guard.JudgePromptFile == "" {
@@ -278,6 +286,13 @@ func (c *Config) validate() error {
 	c.Stats.ScorePromptFile = strings.TrimSpace(c.Stats.ScorePromptFile)
 	if c.Stats.Enabled && c.Stats.ScorePromptFile == "" {
 		return fmt.Errorf("config: stats.score_prompt_file is required when stats.enabled")
+	}
+	c.Memory.UpdatePromptFile = strings.TrimSpace(c.Memory.UpdatePromptFile)
+	if c.Memory.Enabled && c.Memory.UpdatePromptFile == "" {
+		return fmt.Errorf("config: memory.update_prompt_file is required when memory.enabled")
+	}
+	if c.Memory.MaxChars <= 0 {
+		c.Memory.MaxChars = defaultMemory().MaxChars
 	}
 	if c.Agent.PromptFile == "" {
 		return fmt.Errorf("config: agent.prompt_file is required")
@@ -329,9 +344,16 @@ func defaultProactive() Proactive {
 		TopN:                   50,
 		DailyLimit:             3,
 		SessionCooldownSec:     int((6 * time.Hour) / time.Second),
-		PendingTTLSec:          int((30 * time.Minute) / time.Second),
 		RecentEventsCap:        200,
 		DryRun:                 true,
+	}
+}
+
+func defaultMemory() Memory {
+	return Memory{
+		Enabled:          false,
+		UpdatePromptFile: "configs/prompts/memory_update.yaml",
+		MaxChars:         1200,
 	}
 }
 
@@ -367,9 +389,6 @@ func (c *Config) validateProactive() error {
 	}
 	if c.Proactive.SessionCooldownSec <= 0 {
 		c.Proactive.SessionCooldownSec = defaults.SessionCooldownSec
-	}
-	if c.Proactive.PendingTTLSec <= 0 {
-		c.Proactive.PendingTTLSec = defaults.PendingTTLSec
 	}
 	if c.Proactive.RecentEventsCap <= 0 {
 		c.Proactive.RecentEventsCap = defaults.RecentEventsCap

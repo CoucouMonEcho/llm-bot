@@ -5,12 +5,13 @@
 //  2. 加载配置、构造 logger；
 //  3. 连 Redis，构造 HistoryRepo；
 //  4. 加载人设与裁判 prompt YAML；
-//  5. 构造 stats 资源（若启用）：stats.Store、打分 prompt 与打分 ChatModel；
-//  6. 构造 Agent Runnable（这一步会构造主/裁判 ChatModel、编译 Graph）；
-//  7. 构造主动消息资源（若启用）；
+//  5. 必要时构造 stats / memory 共用的 judge ChatModel；
+//  6. 构造 stats / memory 资源（若启用）：Store、prompt 与异步更新 ChatModel；
+//  7. 构造 Agent Runnable（这一步会构造主/裁判 ChatModel、编译 Graph）；
 //  8. 构造 OneBot Adapter；
-//  9. 启动主动调度并把 Bot 主循环跑起来；
-//  10. 监听 SIGINT/SIGTERM 做优雅关闭。
+//  9. 构造主动消息资源（若启用）；
+//  10. 启动主动调度并把 Bot 主循环跑起来；
+//  11. 监听 SIGINT/SIGTERM 做优雅关闭。
 package main
 
 import (
@@ -29,9 +30,11 @@ import (
 	"github.com/echo/llm-bot/internal/agent/guard"
 	"github.com/echo/llm-bot/internal/bot"
 	"github.com/echo/llm-bot/internal/config"
+	"github.com/echo/llm-bot/internal/memory"
 	"github.com/echo/llm-bot/internal/proactive"
 	"github.com/echo/llm-bot/internal/stats"
 	"github.com/echo/llm-bot/internal/store"
+	"github.com/redis/go-redis/v9"
 )
 
 // defaultShutdownTimeout 是优雅关闭阶段最多等待的时长。
@@ -79,97 +82,52 @@ func main() {
 		}
 	}
 
-	// 步骤 5：构造 stats 资源（若启用）。
-	// 产出三件东西:
+	// 步骤 5：stats / memory 都用 cfg.Judge 做异步打分 / 摘要更新；只有任一启用时
+	// 才构造一次共享的 judge ChatModel，避免没用上还白白连一次模型 API。
+	var judgeModel model.BaseChatModel
+	if cfg.Stats.Enabled || cfg.Memory.Enabled {
+		judgeModel, err = agent.NewChatModel(ctx, cfg.Judge)
+		if err != nil {
+			fatal("build judge chat model: %v", err)
+		}
+	}
+
+	// 步骤 6：构造 stats / memory 资源（若启用）。
+	// stats 产出三件东西:
 	//   - statsStore：传给 agent.Build，用于 prepareStats 节点结算并读取参数快照；
 	//   - scorePrompt：传给 scoreStats 节点作为打分模型的 system prompt；
 	//   - scoreModel：传给 agent.Build，用于 scoreStats 节点在回复生成后异步打分。
-	// 打分模型复用 cfg.Judge——打分的负载特征（短 prompt、严格 JSON、低 QPS）
-	// 与 judge 接近，共享一份配置避免再引入一个 LLM 配置段。
+	// memory 同理传入 memoryStore / memoryPrompt / memoryModel，用于读取长期记忆
+	// 与回复后的异步摘要更新。
+	// 两条异步链路都复用 cfg.Judge——负载特征（短 prompt、严格 JSON、低 QPS）
+	// 与 judge 接近，共享一份配置避免再引入额外 LLM 配置段。
 	//
-	// stats.enabled=false 时这些资源都保持零值；agent graph 内部会安全处理 nil，
-	// main 这里无需塞哨兵对象。
-	var statsStore *stats.Store
-	var scoreModel model.BaseChatModel
-	var scorePrompt string
-	if cfg.Stats.Enabled {
-		scorePrompt, err = stats.LoadScorePrompt(cfg.Stats.ScorePromptFile)
-		if err != nil {
-			fatal("load stats score prompt: %v", err)
-		}
-		statsStore = stats.NewStore(redisCli, logger)
-		sm, err := agent.NewChatModel(ctx, cfg.Judge)
-		if err != nil {
-			fatal("build stats score model: %v", err)
-		}
-		scoreModel = sm
-		logger.Info("stats feature enabled")
+	// 功能关闭时这些资源都保持零值；agent graph 内部会安全处理 nil，main 这里
+	// 无需塞哨兵对象。
+	statsStore, scoreModel, scorePrompt, err := buildStats(cfg, redisCli, logger, judgeModel)
+	if err != nil {
+		fatal("%v", err)
+	}
+	memoryStore, memoryModel, memoryPrompt, err := buildMemory(cfg, redisCli, logger, judgeModel)
+	if err != nil {
+		fatal("%v", err)
 	}
 
-	// 步骤 6：构造 Agent Runnable。
+	// 步骤 7：构造 Agent Runnable。
 	runnable, err := agent.Build(ctx, cfg, agent.Deps{
-		History:     historyRepo,
-		Persona:     persona,
-		Logger:      logger,
-		Stats:       statsStore,
-		JudgePrompt: judgePrompt,
-		ScoreModel:  scoreModel,
-		ScorePrompt: scorePrompt,
+		History:      historyRepo,
+		Persona:      persona,
+		Logger:       logger,
+		Stats:        statsStore,
+		Memory:       memoryStore,
+		JudgePrompt:  judgePrompt,
+		ScoreModel:   scoreModel,
+		ScorePrompt:  scorePrompt,
+		MemoryModel:  memoryModel,
+		MemoryPrompt: memoryPrompt,
 	})
 	if err != nil {
 		fatal("build agent: %v", err)
-	}
-
-	// 步骤 7：构造主动消息组件（若启用）。
-	// Bot 层只拿到 ActivityRecorder 这个窄接口，用来记录真实入站活跃；
-	// 主动消息的候选选择、去重、冷却、dry-run 与 Redis key 都留在 proactive 包内。
-	// 这里先把 State / Selector / Generator 拼好，Scheduler 等 Adapter start 后再启动，
-	// 因为它需要把生成结果通过同一个 Adapter 发回平台。
-	var activityRecorder bot.ActivityRecorder
-	var proactiveState *proactive.State
-	var proactiveSelector *proactive.Selector
-	var proactiveGenerator *proactive.Generator
-	var proactiveCfg proactive.Config
-	if cfg.Proactive.Enabled {
-		proactiveState = proactive.NewState(redisCli, logger)
-		activityRecorder = proactive.NewActivityRecorder(proactiveState, logger, proactive.RecorderConfig{
-			RecentGroupEventCap: cfg.Proactive.RecentEventsCap,
-		})
-
-		proactiveModel, err := agent.NewChatModel(ctx, cfg.LLM)
-		if err != nil {
-			fatal("build proactive model: %v", err)
-		}
-		proactivePrompts, err := proactive.LoadGeneratorPrompts(cfg.Proactive.PromptFile)
-		if err != nil {
-			fatal("load proactive prompts: %v", err)
-		}
-		proactiveCfg = proactive.Config{
-			Enabled:     cfg.Proactive.Enabled,
-			WindowStart: cfg.Proactive.WindowStart,
-			WindowEnd:   cfg.Proactive.WindowEnd,
-			Interval:    cfg.Proactive.Interval(),
-			Jitter:      cfg.Proactive.JitterMax(),
-			DailyLimit:  cfg.Proactive.DailyLimit,
-			DryRun:      cfg.Proactive.DryRun,
-			PendingTTL:  cfg.Proactive.PendingTTL(),
-			Selector: proactive.SelectorConfig{
-				AffinityTopN:    cfg.Proactive.TopN,
-				MinSince:        cfg.Proactive.MinSinceLastInbound(),
-				MaxSince:        cfg.Proactive.MaxSinceLastInbound(),
-				RecentEventScan: cfg.Proactive.RecentEventsCap,
-				SessionCooldown: cfg.Proactive.SessionCooldown(),
-			},
-		}
-		proactiveSelector = proactive.NewSelector(proactiveState, logger, proactiveCfg.Selector)
-		proactiveGenerator = proactive.NewGenerator(proactive.GeneratorOptions{
-			Model:   proactiveModel,
-			History: historyRepo,
-			Logger:  logger,
-			Config:  proactiveCfg.Generator,
-			Prompts: proactivePrompts,
-		})
-		logger.Info("proactive feature enabled", slog.Bool("dry_run", cfg.Proactive.DryRun))
 	}
 
 	// 步骤 8：构造 OneBot Adapter。
@@ -177,31 +135,126 @@ func main() {
 	if err := ad.Start(ctx); err != nil {
 		fatal("start adapter: %v", err)
 	}
-	if proactiveState != nil {
-		// 主动调度与主循环共享同一个 ctx：进程收到退出信号时两条链路一起停。
-		// Scheduler 内部会做时间窗、全局开关、每日上限和候选锁定；main 只负责接线。
-		proactiveScheduler := proactive.NewScheduler(proactive.Options{
-			State:     proactiveState,
-			Selector:  proactiveSelector,
-			Generator: proactiveGenerator,
-			Sender:    ad,
-			Logger:    logger,
-			Config:    proactiveCfg,
-		})
-		go proactiveScheduler.Run(ctx)
+
+	// 步骤 9：构造主动消息组件（若启用）。
+	// Bot 层拿到具体的 *proactive.ActivityRecorder（关闭时为 nil），用来旁路
+	// 记录真实入站活跃；主动消息的候选选择、去重、冷却、dry-run 与 Redis key
+	// 都留在 proactive 包内。Scheduler 在 Adapter start 之后再启动，因为它需
+	// 要把生成结果通过同一个 Adapter 发回平台。
+	activityRecorder, proactiveScheduler, err := buildProactive(ctx, cfg, redisCli, historyRepo, statsStore, ad, logger)
+	if err != nil {
+		fatal("%v", err)
 	}
 
-	// 步骤 9：运行主循环。
+	// 步骤 10：启动主动调度并跑主循环。
+	if proactiveScheduler != nil {
+		// 主动调度与主循环共享同一个 ctx：进程收到退出信号时两条链路一起停。
+		go proactiveScheduler.Run(ctx)
+	}
 	b := bot.New(ad, runnable, activityRecorder, logger)
 	b.Run(ctx) // 阻塞直到 ctx 被取消
 
-	// 步骤 10：优雅关闭。
+	// 步骤 11：优雅关闭。
 	logger.Info("shutting down")
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), defaultShutdownTimeout)
 	defer shutdownCancel()
 	if err := ad.Stop(shutdownCtx); err != nil {
 		logger.Error("adapter stop error", slog.Any("err", err))
 	}
+}
+
+// buildStats 构造 stats 模块所需的 Store / 打分模型 / 打分 prompt。
+//
+// 关闭时返回零值，调用方按零值传给 agent.Build；judgeModel 此时也无需构造。
+// 这里把"装配"集中到一处，让 main 不再重复 if cfg.Stats.Enabled 的分支。
+func buildStats(cfg *config.Config, redisCli *redis.Client, logger *slog.Logger, judgeModel model.BaseChatModel) (*stats.Store, model.BaseChatModel, string, error) {
+	if !cfg.Stats.Enabled {
+		return nil, nil, "", nil
+	}
+	scorePrompt, err := stats.LoadScorePrompt(cfg.Stats.ScorePromptFile)
+	if err != nil {
+		return nil, nil, "", fmt.Errorf("load stats score prompt: %w", err)
+	}
+	store := stats.NewStore(redisCli, logger)
+	logger.Info("stats feature enabled")
+	return store, judgeModel, scorePrompt, nil
+}
+
+// buildMemory 构造长期记忆所需的 Store / 更新模型 / 更新 prompt。
+//
+// 关闭时返回零值。和 buildStats 一样，靠共享的 judgeModel 复用 cfg.Judge。
+func buildMemory(cfg *config.Config, redisCli *redis.Client, logger *slog.Logger, judgeModel model.BaseChatModel) (*memory.Store, model.BaseChatModel, string, error) {
+	if !cfg.Memory.Enabled {
+		return nil, nil, "", nil
+	}
+	updatePrompt, err := memory.LoadUpdatePrompt(cfg.Memory.UpdatePromptFile)
+	if err != nil {
+		return nil, nil, "", fmt.Errorf("load memory update prompt: %w", err)
+	}
+	store := memory.NewStore(redisCli, logger)
+	logger.Info("memory feature enabled", slog.Int("max_chars", cfg.Memory.MaxChars))
+	return store, judgeModel, updatePrompt, nil
+}
+
+// buildProactive 构造主动消息所需的 ActivityRecorder 与 Scheduler。
+//
+// 关闭时全部返回 nil；Bot 拿到 nil ActivityRecorder 也能正常工作。Sender
+// 作为参数传入，是因为只有 Adapter 自己知道怎么把消息发回平台，proactive
+// 内部不绑定 onebot 实现。statsStore 提供好感度排行；为 nil 时 Selector 的
+// 第一阶段会自动跳过。
+func buildProactive(ctx context.Context, cfg *config.Config, redisCli *redis.Client, historyRepo store.HistoryRepo, statsStore *stats.Store, sender proactive.Sender, logger *slog.Logger) (*proactive.ActivityRecorder, *proactive.Scheduler, error) {
+	if !cfg.Proactive.Enabled {
+		return nil, nil, nil
+	}
+	state := proactive.NewState(redisCli, logger)
+	recorder := proactive.NewActivityRecorder(state, logger, proactive.RecorderConfig{
+		RecentGroupEventCap: cfg.Proactive.RecentEventsCap,
+	})
+
+	proactiveModel, err := agent.NewChatModel(ctx, cfg.LLM)
+	if err != nil {
+		return nil, nil, fmt.Errorf("build proactive model: %w", err)
+	}
+	prompts, err := proactive.LoadGeneratorPrompts(cfg.Proactive.PromptFile)
+	if err != nil {
+		return nil, nil, fmt.Errorf("load proactive prompts: %w", err)
+	}
+	// HistorySize / MaxHistoryChars 直接在装配点固化：proactive 包内不再保留
+	// 默认值常量，main 是唯一选择"取多少历史给主动开场白参考"的地方。
+	proactiveCfg := proactive.Config{
+		Enabled:         cfg.Proactive.Enabled,
+		WindowStart:     cfg.Proactive.WindowStart,
+		WindowEnd:       cfg.Proactive.WindowEnd,
+		Interval:        cfg.Proactive.Interval(),
+		Jitter:          cfg.Proactive.JitterMax(),
+		DailyLimit:      cfg.Proactive.DailyLimit,
+		DryRun:          cfg.Proactive.DryRun,
+		AffinityTopN:    cfg.Proactive.TopN,
+		MinSinceLast:    cfg.Proactive.MinSinceLastInbound(),
+		MaxSinceLast:    cfg.Proactive.MaxSinceLastInbound(),
+		RecentEventScan: cfg.Proactive.RecentEventsCap,
+		SessionCooldown: cfg.Proactive.SessionCooldown(),
+		HistorySize:     6,
+		MaxHistoryChars: 1200,
+	}
+	selector := proactive.NewSelector(state, statsStore, logger, proactiveCfg)
+	generator := proactive.NewGenerator(proactive.GeneratorOptions{
+		Model:   proactiveModel,
+		History: historyRepo,
+		Logger:  logger,
+		Config:  proactiveCfg,
+		Prompts: prompts,
+	})
+	scheduler := proactive.NewScheduler(proactive.Options{
+		State:     state,
+		Selector:  selector,
+		Generator: generator,
+		Sender:    sender,
+		Logger:    logger,
+		Config:    proactiveCfg,
+	})
+	logger.Info("proactive feature enabled", slog.Bool("dry_run", cfg.Proactive.DryRun))
+	return recorder, scheduler, nil
 }
 
 // newLogger 按配置级别构造 slog.Logger（JSON 格式便于采集）。

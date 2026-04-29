@@ -1,7 +1,7 @@
 // Package proactive 的 scheduler.go 实现主动消息调度循环。
 //
 // 调度器按固定间隔加随机抖动运行：先检查配置开关和 Redis 运行期开关，再判断时间窗、
-// 日限额、候选、生成和发送。发送成功后才写冷却、日计数和 PendingContext。
+// 日限额、候选、生成和发送。发送成功后才写冷却、日计数。
 package proactive
 
 import (
@@ -17,23 +17,16 @@ import (
 	"github.com/echo/llm-bot/internal/domain"
 )
 
-const (
-	// 默认允许白天到凌晨一点，避免深夜继续主动打扰。
-	defaultWindowStart = "10:00"
-	defaultWindowEnd   = "01:00"
-	// 调度频率默认偏低，配合 jitter 避免整点规律性触发。
-	defaultInterval = time.Hour
-	defaultJitter   = 10 * time.Minute
-	// 单日默认最多三条，主动功能宁可少发也不要刷屏。
-	defaultDailyLimit = 3
-	// 发送链路给独立超时，避免下游平台卡住整个调度循环。
-	defaultSendTimeout = 15 * time.Second
-)
+// sendTimeout 给发送链路独立超时，避免下游平台卡住整个调度循环。
+const sendTimeout = 15 * time.Second
 
 // Config 是主动消息调度器的静态配置。
 //
 // WindowStart/WindowEnd 使用本地时间的 HH:MM 字符串；Enabled 只代表配置侧开关，
 // 还必须同时打开 Redis 运行期开关才会真正发送。DryRun 只生成和记录日志，不写发送状态。
+//
+// Selector / Generator 关心的字段直接平铺在这里——proactive 内部的几个组件
+// 都从同一份 Config 取自己关心的子集，避免再嵌套一层只为了"按职责分组"。
 type Config struct {
 	Enabled     bool
 	WindowStart string
@@ -42,56 +35,17 @@ type Config struct {
 	Jitter      time.Duration
 	DailyLimit  int
 	DryRun      bool
-	PendingTTL  time.Duration
-	SendTimeout time.Duration
 
-	Selector  SelectorConfig
-	Generator GeneratorConfig
-}
+	// 选择器相关
+	AffinityTopN    int
+	MinSinceLast    time.Duration
+	MaxSinceLast    time.Duration
+	RecentEventScan int
+	SessionCooldown time.Duration
 
-// DefaultConfig 返回偏保守的默认配置；Enabled 默认关闭，避免接入后意外发送。
-func DefaultConfig() Config {
-	return Config{
-		Enabled:     false,
-		WindowStart: defaultWindowStart,
-		WindowEnd:   defaultWindowEnd,
-		Interval:    defaultInterval,
-		Jitter:      defaultJitter,
-		DailyLimit:  defaultDailyLimit,
-		PendingTTL:  defaultPendingTTL,
-		SendTimeout: defaultSendTimeout,
-		Selector:    DefaultSelectorConfig(),
-		Generator:   DefaultGeneratorConfig(),
-	}
-}
-
-// withDefaults 补齐静态配置；Jitter 允许显式设为 0 来关闭随机抖动。
-func (c Config) withDefaults() Config {
-	d := DefaultConfig()
-	if c.WindowStart == "" {
-		c.WindowStart = d.WindowStart
-	}
-	if c.WindowEnd == "" {
-		c.WindowEnd = d.WindowEnd
-	}
-	if c.Interval <= 0 {
-		c.Interval = d.Interval
-	}
-	if c.Jitter < 0 {
-		c.Jitter = 0
-	}
-	if c.DailyLimit <= 0 {
-		c.DailyLimit = d.DailyLimit
-	}
-	if c.PendingTTL <= 0 {
-		c.PendingTTL = d.PendingTTL
-	}
-	if c.SendTimeout <= 0 {
-		c.SendTimeout = d.SendTimeout
-	}
-	c.Selector = c.Selector.withDefaults()
-	c.Generator = c.Generator.withDefaults()
-	return c
+	// 生成器相关
+	HistorySize     int
+	MaxHistoryChars int
 }
 
 // Sender 是调度器依赖的最小发送接口。
@@ -131,7 +85,10 @@ type Scheduler struct {
 
 // NewScheduler 构造调度器；这里不做分布式锁，调用方需保证只启动一个实例。
 func NewScheduler(opts Options) *Scheduler {
-	cfg := opts.Config.withDefaults()
+	cfg := opts.Config
+	if cfg.Interval <= 0 {
+		cfg.Interval = time.Hour
+	}
 	return &Scheduler{
 		state:     opts.State,
 		selector:  opts.Selector,
@@ -171,7 +128,7 @@ func (s *Scheduler) Run(ctx context.Context) {
 // RunOnce 执行一轮调度；生产路径通常由 Run 调用，测试和管理命令可直接使用。
 //
 // 静态开关、运行期开关、时间窗、日限额都会在生成前短路。只有真实发送成功后才写
-// 最近主动发送时间、日计数和 PendingContext，保证这些状态与实际发出的消息一致。
+// 最近主动发送时间和日计数，保证这些状态与实际发出的消息一致。
 func (s *Scheduler) RunOnce(ctx context.Context) error {
 	if s == nil {
 		return fmt.Errorf("proactive: nil scheduler")
@@ -227,7 +184,7 @@ func (s *Scheduler) RunOnce(ctx context.Context) error {
 		return err
 	}
 	if s.cfg.DryRun {
-		// DryRun 只产生日志，不发送消息，也不写入冷却、日限额或 PendingContext。
+		// DryRun 只产生日志，不发送消息，也不写入冷却或日限额。
 		s.log.Info("proactive dry-run would send",
 			"platform", cand.Platform,
 			"convType", cand.ConvType,
@@ -237,12 +194,8 @@ func (s *Scheduler) RunOnce(ctx context.Context) error {
 		return nil
 	}
 
-	sendCtx := ctx
-	var cancel context.CancelFunc
-	if s.cfg.SendTimeout > 0 {
-		sendCtx, cancel = context.WithTimeout(ctx, s.cfg.SendTimeout)
-		defer cancel()
-	}
+	sendCtx, cancel := context.WithTimeout(ctx, sendTimeout)
+	defer cancel()
 	if err := s.sender.Send(sendCtx, &domain.OutboundMessage{
 		Platform:  cand.Platform,
 		ConvType:  cand.ConvType,
@@ -253,22 +206,11 @@ func (s *Scheduler) RunOnce(ctx context.Context) error {
 		return fmt.Errorf("proactive: send message: %w", err)
 	}
 
-	// 只有真实发送成功后才写状态：冷却时间、日限额和 PendingContext 必须保持一致。
+	// 只有真实发送成功后才写状态：冷却时间和日限额必须保持一致。
 	if err := s.state.SetLastProactiveAt(ctx, cand.Platform, cand.SessionID, now); err != nil {
 		return err
 	}
 	if _, err := s.state.IncrementDailyCount(ctx, now); err != nil {
-		return err
-	}
-	if err := s.state.SetPendingContext(ctx, PendingContext{
-		Platform:      cand.Platform,
-		ConvType:      cand.ConvType,
-		SessionID:     cand.SessionID,
-		UserID:        cand.UserID,
-		Source:        cand.Source,
-		Text:          text,
-		CreatedAtUnix: now.Unix(),
-	}, s.cfg.PendingTTL); err != nil {
 		return err
 	}
 
@@ -324,10 +266,8 @@ func parseHHMM(value string) (int, error) {
 // nextDelay 计算下一轮等待时间；jitter 为 [0, jitter] 的正向随机抖动。
 //
 // 只向后加抖动，避免比配置 interval 更频繁地触发主动发送。
+// interval 由 NewScheduler 兜底，这里直接信任入参。
 func nextDelay(interval, jitter time.Duration, int63n func(int64) int64) time.Duration {
-	if interval <= 0 {
-		interval = defaultInterval
-	}
 	if jitter <= 0 || int63n == nil {
 		return interval
 	}

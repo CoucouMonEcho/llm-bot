@@ -31,7 +31,6 @@ generator:
     - "internal"
     - "whitelist"
     - "好感"
-    - "分数"
     - "策略"
     - "候选"
     - "调度"
