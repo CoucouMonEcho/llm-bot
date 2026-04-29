@@ -8,8 +8,10 @@ package bot
 import (
 	"context"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/echo/llm-bot/internal/adapter"
 	"github.com/echo/llm-bot/internal/agent"
@@ -24,6 +26,16 @@ const maxConcurrent = 32
 // replyTimeout 单条消息从触发到发送完成的最大时长。
 // 超时意味着整个链路（防护、主链、后处理、落历史、发送）都断掉。
 const replyTimeout = 60 * time.Second
+
+const sendDeadlineReserve = 300 * time.Millisecond
+
+type replyLengthTier int
+
+const (
+	replyTierShort replyLengthTier = iota
+	replyTierMedium
+	replyTierLong
+)
 
 // Bot 聚合 Adapter 与 Runnable，是整个服务的"大主循环"载体。
 type Bot struct {
@@ -108,6 +120,7 @@ func (b *Bot) Run(ctx context.Context) {
 // stats 打分不在这里做：Agent Graph 已在回复生成后通过 scoreStats 异步触发，
 // 不再把参数更新绑定到 Adapter 发送成功与否。
 func (b *Bot) handle(parent context.Context, m *domain.InboundMessage) {
+	receivedAt := time.Now()
 	ctx, cancel := context.WithTimeout(parent, replyTimeout)
 	defer cancel()
 
@@ -144,13 +157,19 @@ func (b *Bot) handle(parent context.Context, m *domain.InboundMessage) {
 		return
 	}
 
+	tier := classifyReplyLength(state.Reply.Content)
+	if err := waitBeforeSend(ctx, receivedAt, targetReplyLatency(tier)); err != nil {
+		lg.Warn("reply delayed until context done", slog.Any("err", err))
+		return
+	}
+
 	// 步骤 3：回发。
 	out := &domain.OutboundMessage{
 		Platform:  m.Platform,
 		ConvType:  m.ConvType,
 		SessionID: m.SessionID,
 		Text:      state.Reply.Content,
-		ReplyTo:   decideReplyTarget(m),
+		ReplyTo:   decideReplyTarget(m, tier),
 	}
 	if err := b.adapter.Send(ctx, out); err != nil {
 		lg.Error("adapter send failed", slog.Any("err", err))
@@ -170,23 +189,89 @@ func (b *Bot) handle(parent context.Context, m *domain.InboundMessage) {
 
 }
 
+// classifyReplyLength 用 rune 数而不是字节数衡量文本量，中文和 emoji 都能稳定分档。
+func classifyReplyLength(text string) replyLengthTier {
+	n := utf8.RuneCountInString(strings.TrimSpace(text))
+	switch {
+	case n <= 12:
+		return replyTierShort
+	case n <= 35:
+		return replyTierMedium
+	default:
+		return replyTierLong
+	}
+}
+
+// targetReplyLatency 是从收到消息到发出回复的目标总耗时。
+//
+// 这些数值比常见移动端/中文输入速度更快，但能避免 LLM 生成很快时出现"秒回长文"
+// 的机器感。若模型调用本身已经超过目标耗时，waitBeforeSend 不会再额外等待。
+func targetReplyLatency(tier replyLengthTier) time.Duration {
+	switch tier {
+	case replyTierShort:
+		return 1200 * time.Millisecond
+	case replyTierMedium:
+		return 3500 * time.Millisecond
+	default:
+		return 6500 * time.Millisecond
+	}
+}
+
+func waitBeforeSend(ctx context.Context, receivedAt time.Time, targetTotal time.Duration) error {
+	if targetTotal <= 0 {
+		return nil
+	}
+	delay := targetTotal - time.Since(receivedAt)
+	if delay <= 0 {
+		return nil
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		remaining := time.Until(deadline) - sendDeadlineReserve
+		if remaining <= 0 {
+			return nil
+		}
+		if delay > remaining {
+			delay = remaining
+		}
+	}
+
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
 // decideReplyTarget 逐条决定本次回复要不要 @、要不要引用、或是什么都不加。
 //
 // 这是 Bot 层"回复样式"唯一的决策入口。之所以写成一个函数而不是挂到
 // 全局 config / Bot 结构上，是因为"样式"天然属于消息级语境——
 //   - "主动发消息、不艾特任何人"       → 返回 nil；
-//   - "某些场景艾特、某些场景不艾特"   → 根据 m 的上下文分支；
+//   - "短句不打扰、中句 @、长句引用"    → 根据回复文本量分支；
 //   - "被攻击的降级回复不引用原消息"   → 未来可再传入 *flow.State 判断。
 //
 // 任何新增策略都应当只改本函数的实现，避免把开关在全局配置里四处蔓延。
 //
-// 当前默认策略（在更细的规则敲定前，先保证行为可用）：
+// 当前策略：
 //   - 私聊：无需指向，返回 nil；
-//   - 群聊且已知发信人：@ 发信人，让群友看清楚是回给谁的；
-//   - 其他不满足条件的情况（比如缺失 UserID）：返回 nil，Adapter 按纯文本发送。
-func decideReplyTarget(m *domain.InboundMessage) *domain.ReplyTarget {
+//   - 群聊短回复：直接发送，不 @，降低轻量回复的打扰感；
+//   - 群聊中等回复：@ 发信人；
+//   - 群聊长回复：优先引用原消息，缺少 MessageID 时降级为 @。
+func decideReplyTarget(m *domain.InboundMessage, tier replyLengthTier) *domain.ReplyTarget {
 	if m == nil || m.ConvType != domain.ConversationGroup {
 		return nil
+	}
+	if tier == replyTierShort {
+		return nil
+	}
+	if tier == replyTierLong && m.MessageID != "" {
+		return &domain.ReplyTarget{
+			Mode:      domain.ReplyModeQuote,
+			MessageID: m.MessageID,
+		}
 	}
 	if m.UserID == "" {
 		return nil

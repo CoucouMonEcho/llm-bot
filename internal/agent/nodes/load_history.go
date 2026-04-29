@@ -14,9 +14,12 @@ import (
 	"log/slog"
 
 	"github.com/cloudwego/eino/compose"
+	"github.com/cloudwego/eino/schema"
 	"github.com/echo/llm-bot/internal/agent/flow"
 	"github.com/echo/llm-bot/internal/store"
 )
+
+const personalHistorySupplementSize = 4
 
 // NewLoadHistory 构造 loadHistory 节点。
 //
@@ -33,7 +36,52 @@ func NewLoadHistory(repo store.HistoryRepo, historySize int, logger *slog.Logger
 			st.History = nil
 			return st, nil
 		}
+		if st.In.ConvType == "group" && st.In.UserID != "" {
+			personalSessionID := "private_" + st.In.UserID
+			personal, err := repo.Load(ctx, personalSessionID, personalHistorySupplementSize)
+			if err != nil {
+				// 个人历史只是群聊里的补充上下文，失败时保留群聊主线即可。
+				lg.Warn("load personal supplement failed, keep session history",
+					slog.String("session", st.In.SessionID),
+					slog.String("personalSession", personalSessionID),
+					slog.Any("err", err))
+			} else {
+				history = mergePersonalSupplement(personal, history)
+			}
+		}
 		st.History = history
 		return st, nil
 	})
+}
+
+func mergePersonalSupplement(personal, session []*schema.Message) []*schema.Message {
+	if len(personal) == 0 {
+		return session
+	}
+	seen := make(map[string]struct{}, len(personal)+len(session))
+	for _, msg := range session {
+		if msg == nil {
+			continue
+		}
+		seen[historyMessageKey(msg)] = struct{}{}
+	}
+
+	merged := make([]*schema.Message, 0, len(personal)+len(session))
+	for _, msg := range personal {
+		if msg == nil {
+			continue
+		}
+		key := historyMessageKey(msg)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		merged = append(merged, msg)
+	}
+	merged = append(merged, session...)
+	return merged
+}
+
+func historyMessageKey(msg *schema.Message) string {
+	return string(msg.Role) + "\x00" + msg.Name + "\x00" + msg.Content
 }
