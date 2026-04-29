@@ -156,7 +156,7 @@ func main() {
 	}
 
 	// 步骤 8：构造 OneBot Adapter。
-	ad := onebot.New(cfg.Server, cfg.Trigger, logger)
+	ad := onebot.New(cfg.Server, cfg.Trigger, cfg.Blacklist, logger)
 	if err := ad.Start(ctx); err != nil {
 		fatal("start adapter: %v", err)
 	}

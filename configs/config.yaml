@@ -61,6 +61,11 @@ trigger:
   group_at_only: true        # 群聊仅在 @ 机器人时触发
   prefix:        ["/bot"]    # 显式前缀（群聊可绕过 @ 限制）
 
+# 黑名单：命中后在 Adapter 源头忽略，不进入历史、stats 或 LLM 调用。
+blacklist:
+  user_ids:
+    - "2854196310" # Q群管家
+
 # 日志级别：debug / info / warn / error
 log:
   level: "info"

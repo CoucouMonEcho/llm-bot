@@ -40,9 +40,10 @@ const writeTimeout = 3 * time.Second
 
 // Adapter 是 onebot 包对外的唯一实现，满足 adapter.Adapter 接口。
 type Adapter struct {
-	cfg     config.Server
-	trigger config.Trigger
-	logger  *slog.Logger
+	cfg       config.Server
+	trigger   config.Trigger
+	blacklist config.Blacklist
+	logger    *slog.Logger
 
 	upgrader websocket.Upgrader
 
@@ -70,12 +71,14 @@ type Adapter struct {
 // 参数：
 //   - srvCfg：HTTP/WS 监听参数；
 //   - tr：触发规则（会传给事件解码器做源头过滤）；
+//   - blacklist：用户黑名单（会传给事件解码器做源头过滤）；
 //   - logger：结构化日志器。
-func New(srvCfg config.Server, tr config.Trigger, logger *slog.Logger) *Adapter {
+func New(srvCfg config.Server, tr config.Trigger, blacklist config.Blacklist, logger *slog.Logger) *Adapter {
 	return &Adapter{
-		cfg:     srvCfg,
-		trigger: tr,
-		logger:  logger.With(slog.String("component", "adapter.onebot")),
+		cfg:       srvCfg,
+		trigger:   tr,
+		blacklist: blacklist,
+		logger:    logger.With(slog.String("component", "adapter.onebot")),
 		upgrader: websocket.Upgrader{
 			// NapCat 是同机或内网部署，CORS 不构成安全问题。
 			CheckOrigin: func(r *http.Request) bool { return true },
@@ -234,7 +237,7 @@ func (a *Adapter) readLoop(conn *websocket.Conn, selfID int64) {
 			return
 		}
 
-		msg, decodeErr := decodeAndFilter(data, selfID, a.trigger)
+		msg, decodeErr := decodeAndFilter(data, selfID, a.trigger, a.blacklist)
 		if decodeErr != nil {
 			a.logger.Warn("onebot decode error",
 				slog.Any("err", decodeErr),

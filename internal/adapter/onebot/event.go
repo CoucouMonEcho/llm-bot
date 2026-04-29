@@ -57,11 +57,12 @@ type messageSegment struct {
 // 处理步骤：
 //  1. JSON 解码到 rawEvent；
 //  2. 只接受 post_type == "message" 的事件，其他（心跳、元事件）全部忽略；
-//  3. 根据配置的 trigger 规则判断"该不该理"——
-//     3.1 私聊：按 trigger.Private 决定；
-//     3.2 群聊：先剥离 @bot 段，随后按 trigger.GroupAtOnly 与 prefix 决定；
-//  4. 构建 InboundMessage，其中 Text 字段是**已经剥离触发标记后**的纯净文本。
-func decodeAndFilter(raw []byte, selfID int64, tr config.Trigger) (*domain.InboundMessage, error) {
+//  3. 按 blacklist.user_ids 过滤用户；
+//  4. 根据配置的 trigger 规则判断"该不该理"——
+//     4.1 私聊：按 trigger.Private 决定；
+//     4.2 群聊：先剥离 @bot 段，随后按 trigger.GroupAtOnly 与 prefix 决定；
+//  5. 构建 InboundMessage，其中 Text 字段是**已经剥离触发标记后**的纯净文本。
+func decodeAndFilter(raw []byte, selfID int64, tr config.Trigger, blacklist config.Blacklist) (*domain.InboundMessage, error) {
 	var ev rawEvent
 	if err := json.Unmarshal(raw, &ev); err != nil {
 		return nil, fmt.Errorf("onebot: unmarshal event: %w", err)
@@ -72,13 +73,17 @@ func decodeAndFilter(raw []byte, selfID int64, tr config.Trigger) (*domain.Inbou
 		return nil, nil
 	}
 
-	// Step 2: 把 message 字段统一规约为 plainText + 是否 @ 了自己。
+	if userBlacklisted(ev.UserID, blacklist) {
+		return nil, nil
+	}
+
+	// Step 3: 把 message 字段统一规约为 plainText + 是否 @ 了自己。
 	plainText, atSelf, err := extractText(ev.Message, ev.RawMessage, selfID)
 	if err != nil {
 		return nil, fmt.Errorf("onebot: extract text: %w", err)
 	}
 
-	// Step 3: 按会话类型与配置做触发过滤。
+	// Step 4: 按会话类型与配置做触发过滤。
 	switch ev.MessageType {
 	case "private":
 		if !tr.Private {
@@ -104,7 +109,7 @@ func decodeAndFilter(raw []byte, selfID int64, tr config.Trigger) (*domain.Inbou
 		return nil, nil
 	}
 
-	// Step 4: 组装 InboundMessage。
+	// Step 5: 组装 InboundMessage。
 	convType := domain.ConversationPrivate
 	sessionID := "private_" + strconv.FormatInt(ev.UserID, 10)
 	if ev.MessageType == "group" {
@@ -124,6 +129,16 @@ func decodeAndFilter(raw []byte, selfID int64, tr config.Trigger) (*domain.Inbou
 		MessageID: strconv.FormatInt(ev.MessageID, 10),
 		Text:      plainText,
 	}, nil
+}
+
+func userBlacklisted(userID int64, blacklist config.Blacklist) bool {
+	id := strconv.FormatInt(userID, 10)
+	for _, blocked := range blacklist.UserIDs {
+		if blocked == id {
+			return true
+		}
+	}
+	return false
 }
 
 // extractText 从 OneBot 消息字段中提取纯文本并识别 @ 段。

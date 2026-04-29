@@ -106,6 +106,7 @@ go run ./cmd/bot -config configs/config.yaml
 - `agent`：Agent 层参数，包括每个 session 的历史条数和人设 YAML 路径。
 - `guard`：防提示词注入相关配置，包括正则黑名单、是否启用 LLM 裁判、fallback 回复池。
 - `trigger`：Adapter 层源头触发规则。私聊可直接触发，群聊可配置为只在 `@bot` 或显式前缀命中时触发。
+- `blacklist`：用户黑名单。`user_ids` 中的用户会在 Adapter 源头被忽略，不进入历史、stats 或 LLM 调用。
 - `stats`：人设参数开关。启用后，回复前读取好感度 / 心情快照，回复生成后异步打分；失败只记录日志，不阻断主回复。
 - `proactive`：主动消息静态策略。`enabled` 是部署期总开关，关闭时不会装配主动消息 recorder / scheduler；`dry_run` 默认为 true，用于只记录“本来会发什么”而不真正发送。
 

@@ -28,9 +28,18 @@ type Config struct {
 	Agent     Agent     `yaml:"agent"`
 	Guard     Guard     `yaml:"guard"`
 	Trigger   Trigger   `yaml:"trigger"`
+	Blacklist Blacklist `yaml:"blacklist"`
 	Log       Log       `yaml:"log"`
 	Stats     Stats     `yaml:"stats"`
 	Proactive Proactive `yaml:"proactive"`
+}
+
+// Blacklist 控制需要在 Adapter 源头忽略的账号。
+//
+// UserIDs 使用字符串保存平台原始用户 ID，避免 QQ 号这类外部标识被当作数值参与
+// 计算或格式化。命中后消息不会进入 bot 主循环、历史、stats 或 LLM 调用。
+type Blacklist struct {
+	UserIDs []string `yaml:"user_ids"`
 }
 
 // Stats 控制"人设参数"功能（当前含好感度 + 心情，可扩展为疲劳度、信任度等
@@ -271,10 +280,28 @@ func (c *Config) validate() error {
 	if len(c.Guard.FallbackReplies) == 0 {
 		return fmt.Errorf("config: guard.fallback_replies must contain at least one entry")
 	}
+	c.normalizeBlacklist()
 	if err := c.validateProactive(); err != nil {
 		return err
 	}
 	return nil
+}
+
+func (c *Config) normalizeBlacklist() {
+	seen := make(map[string]struct{}, len(c.Blacklist.UserIDs))
+	userIDs := c.Blacklist.UserIDs[:0]
+	for _, userID := range c.Blacklist.UserIDs {
+		userID = strings.TrimSpace(userID)
+		if userID == "" {
+			continue
+		}
+		if _, ok := seen[userID]; ok {
+			continue
+		}
+		seen[userID] = struct{}{}
+		userIDs = append(userIDs, userID)
+	}
+	c.Blacklist.UserIDs = userIDs
 }
 
 func defaultProactive() Proactive {
