@@ -31,8 +31,10 @@ const maxReplyRunes = 800
 var collapseBlankLines = regexp.MustCompile(`\n{3,}`)
 
 // NewPostproc 构造 postproc Lambda 节点。
-func NewPostproc() *compose.Lambda {
-	return compose.InvokableLambda(postproc)
+func NewPostproc(emptyReplyFallback string) *compose.Lambda {
+	return compose.InvokableLambda(func(ctx context.Context, st *flow.State) (*flow.State, error) {
+		return postproc(ctx, st, emptyReplyFallback)
+	})
 }
 
 // postproc 对 state.Reply 做清洗并写回 state。返回的 state 与入参同一实例。
@@ -42,7 +44,7 @@ func NewPostproc() *compose.Lambda {
 //  2. 按 rune 截断到 maxReplyRunes；
 //  3. 保证最终 Content 非空——否则把它替换成一个温和的默认回复，避免
 //     下游发送空字符串被 NapCat 拒绝。
-func postproc(_ context.Context, st *flow.State) (*flow.State, error) {
+func postproc(_ context.Context, st *flow.State, emptyReplyFallback string) (*flow.State, error) {
 	if st.Reply == nil {
 		return st, nil
 	}
@@ -61,6 +63,6 @@ func postproc(_ context.Context, st *flow.State) (*flow.State, error) {
 	}
 
 	// 第三步：确保非空——清洗后若空，兜底一句温和的占位回复。
-	st.Reply.Content = cmp.Or(content, "我去洗澡了")
+	st.Reply.Content = cmp.Or(content, emptyReplyFallback)
 	return st, nil
 }

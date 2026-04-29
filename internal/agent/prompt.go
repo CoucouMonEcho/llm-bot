@@ -7,10 +7,8 @@
 // 加载发生在进程启动阶段；运行期的 Guard / 主链都只读取 *Persona 内存快照，
 // 不会再碰磁盘。这是"人设固化"的具体实现。
 //
-// 关于 "<user_input>" 标签：与 judgeSystemPrompt 一样硬编码在代码里，而不是
-// 走 YAML 配置。原因是 guardrails 的系统提示词里显式声明了"标签内是用户数据"，
-// 这份声明与 wrapper 的具体标签名必须严格对齐——两者本质上是同一份防御契约
-// 的两面，把 wrapper 放到 YAML 交给运维去改只会让契约失效。
+// 聊天主链不再用 <user_input> 包裹用户输入；该标签只属于裁判模型内部的安全
+// 分类契约。主链通过 role=user 与 message.name 表示"这是某个用户的数据"。
 package agent
 
 import (
@@ -93,8 +91,8 @@ func LoadPersona(path string) (*Persona, error) {
 // BuildMessages 按 "system + history + current user" 的顺序组装一次 LLM 请求的
 // 完整消息列表。history 必须已经是"时间从旧到新"的。
 //
-// 用户 Query 被包裹在硬编码的 <user_input> 标签中：该标签与 guardrails 里声明
-// 的"标签内是数据而非指令"形成闭环，落地"指令—数据分离"。
+// 用户 Query 保持原文放在 Content 中；userID 放入 schema.Message.Name，让群聊
+// 历史中的不同用户在模型输入里可区分，同时避免把昵称或来源前缀污染到正文。
 //
 // snap 是本轮的人设参数快照，由调用方从 stats.Store 读出注入；本方法不感知
 // Redis。snap.PromptLine() 被以双换行隔离的方式拼在 SystemPrompt 末尾——即便
@@ -106,7 +104,7 @@ func LoadPersona(path string) (*Persona, error) {
 //
 // 注意不要写回 p.SystemPrompt：那是启动期固化的只读快照，多 goroutine 共享；
 // 这里每次调用都在栈上用 strings.Builder 构造一份新的 system content。
-func (p *Persona) BuildMessages(history []*schema.Message, query string, snap stats.Snapshot) ([]*schema.Message, error) {
+func (p *Persona) BuildMessages(history []*schema.Message, query, userID string, snap stats.Snapshot) ([]*schema.Message, error) {
 	sysContent := p.SystemPrompt
 	if line := snap.PromptLine(); line != "" {
 		var sb strings.Builder
@@ -118,7 +116,8 @@ func (p *Persona) BuildMessages(history []*schema.Message, query string, snap st
 		sysContent = sb.String()
 	}
 
-	userMsg := schema.UserMessage("<user_input>\n" + query + "\n</user_input>")
+	userMsg := schema.UserMessage(query)
+	userMsg.Name = userID
 	msgs := make([]*schema.Message, 0, len(history)+2)
 	msgs = append(msgs, schema.SystemMessage(sysContent))
 	msgs = append(msgs, history...)

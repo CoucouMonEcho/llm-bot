@@ -18,32 +18,6 @@ import (
 	"github.com/echo/llm-bot/internal/store"
 )
 
-// generatorSystemPrompt 是主动生成模型的硬约束。
-//
-// 主动消息不能暴露候选策略、好感度、白名单等内部依据，也不能把群聊/私聊历史串场；
-// 这些规则放在系统消息里，避免每次组装提示词时散落重复文本。
-const generatorSystemPrompt = `你负责为聊天机器人写一条简短、自然的主动开场白。
-
-硬性规则：
-- 只输出纯文本，不要 Markdown、列表、解释或引号。
-- 不要使用 @，不要点名群成员。
-- 不要提到好感度、分数、候选、策略、调度、Redis、白名单、内部配置等实现细节。
-- 不要引用、复述或总结历史记录；历史只用于把握语气。
-- 不要把私聊内容带到群聊，也不要把群聊内容带到私聊。
-- 群聊里面向整个群自然开口；私聊里像熟人一样轻轻开启话题。
-- 保持很短，中文不超过 60 字，英文不超过 25 个词。`
-
-// forbiddenGeneratorFragments 是生成后的轻量防漏网。
-//
-// 提示词已经要求不要暴露内部词，但模型仍可能复述“策略/调度/Redis”等词；
-// 发送前再做一次字符串拦截，失败交给调度器记录并等待下一轮。
-var forbiddenGeneratorFragments = []string{
-	"@", "```",
-	"affinity", "score", "scoring", "strategy", "scheduler", "candidate", "redis", "internal", "whitelist",
-	"好感", "分数", "策略", "候选", "调度", "白名单", "内部配置", "运行时开关",
-	"私聊记录", "群聊记录", "聊天记录", "历史记录", "private history", "group history",
-}
-
 // GeneratorConfig 控制主动开场白生成时可读取的上下文量。
 //
 // 历史只用于模仿当前会话语气，不允许模型引用或总结；因此默认读取很少几条。
@@ -85,6 +59,7 @@ type GeneratorOptions struct {
 	History store.HistoryRepo
 	Logger  *slog.Logger
 	Config  GeneratorConfig
+	Prompts GeneratorPrompts
 }
 
 // Generator 负责生成短主动消息。
@@ -92,19 +67,24 @@ type GeneratorOptions struct {
 // 它只读取同一会话历史作为语气参考，不写入长期历史；真正发送和状态写入由
 // Scheduler 完成。
 type Generator struct {
-	model   model.BaseChatModel
-	history store.HistoryRepo
-	log     *slog.Logger
-	cfg     GeneratorConfig
+	model      model.BaseChatModel
+	history    store.HistoryRepo
+	log        *slog.Logger
+	cfg        GeneratorConfig
+	prompts    GeneratorPrompts
+	promptsErr error
 }
 
 // NewGenerator 构造主动消息生成器。
 func NewGenerator(opts GeneratorOptions) *Generator {
+	prompts, promptsErr := opts.Prompts.normalized()
 	return &Generator{
-		model:   opts.Model,
-		history: opts.History,
-		log:     cmp.Or(opts.Logger, slog.Default()),
-		cfg:     opts.Config.withDefaults(),
+		model:      opts.Model,
+		history:    opts.History,
+		log:        cmp.Or(opts.Logger, slog.Default()),
+		cfg:        opts.Config.withDefaults(),
+		prompts:    prompts,
+		promptsErr: promptsErr,
 	}
 }
 
@@ -119,20 +99,23 @@ func (g *Generator) Generate(ctx context.Context, cand Candidate, now time.Time)
 	if cand.Platform == "" || cand.ConvType == "" || cand.SessionID == "" {
 		return "", fmt.Errorf("proactive: incomplete candidate")
 	}
+	if g.promptsErr != nil {
+		return "", fmt.Errorf("proactive: generator prompts: %w", g.promptsErr)
+	}
 
 	history, err := g.loadHistory(ctx, cand.SessionID)
 	if err != nil {
 		return "", err
 	}
 	messages := []*schema.Message{
-		schema.SystemMessage(generatorSystemPrompt),
-		schema.UserMessage(buildGeneratorPrompt(cand, now, history, g.cfg.MaxHistoryChars)),
+		schema.SystemMessage(g.prompts.System),
+		schema.UserMessage(buildGeneratorPrompt(g.prompts, cand, now, history, g.cfg.MaxHistoryChars)),
 	}
 	reply, err := g.model.Generate(ctx, messages)
 	if err != nil {
 		return "", fmt.Errorf("proactive: generate message: %w", err)
 	}
-	text, err := cleanGeneratedText(reply.Content)
+	text, err := cleanGeneratedText(reply.Content, g.prompts.ForbiddenFragments)
 	if err != nil {
 		return "", err
 	}
@@ -154,29 +137,33 @@ func (g *Generator) loadHistory(ctx context.Context, sessionID string) ([]*schem
 // buildGeneratorPrompt 组装用户消息，把候选来源转成模型能理解的上下文。
 //
 // 这里不写入 Source/Affinity 等内部字段，只给时间、会话类型和同会话历史。
-func buildGeneratorPrompt(cand Candidate, now time.Time, history []*schema.Message, maxHistoryChars int) string {
+func buildGeneratorPrompt(prompts GeneratorPrompts, cand Candidate, now time.Time, history []*schema.Message, maxHistoryChars int) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "当前时间：%s\n", now.Format(time.RFC3339))
-	fmt.Fprintf(&b, "会话类型：%s\n", humanConversationType(cand.ConvType))
+	up := prompts.UserPrompt
+	fmt.Fprintf(&b, "%s%s\n", up.CurrentTimeLabel, now.Format(time.RFC3339))
+	fmt.Fprintf(&b, "%s%s\n", up.ConversationTypeLabel, humanConversationType(up.ConversationTypes, cand.ConvType))
 	if cand.ConvType == domain.ConversationPrivate && cand.UserName != "" {
-		fmt.Fprintf(&b, "私聊对象昵称：%s\n", cand.UserName)
+		fmt.Fprintf(&b, "%s%s\n", up.PrivateDisplayNameLabel, cand.UserName)
 	}
 	if !cand.LastInboundAt.IsZero() {
-		fmt.Fprintf(&b, "对方上次主动说话时间：%s\n", cand.LastInboundAt.Format(time.RFC3339))
+		fmt.Fprintf(&b, "%s%s\n", up.LastInboundAtLabel, cand.LastInboundAt.Format(time.RFC3339))
 	}
 	if !cand.EventAt.IsZero() {
-		fmt.Fprintf(&b, "最近群内活动时间：%s\n", cand.EventAt.Format(time.RFC3339))
+		fmt.Fprintf(&b, "%s%s\n", up.RecentGroupActivityLabel, cand.EventAt.Format(time.RFC3339))
 	}
-	b.WriteString("\n同一会话的最近历史（只用于语气，不要引用或复述）：\n")
-	b.WriteString(formatHistory(history, maxHistoryChars))
-	b.WriteString("\n请写一条可以直接发送的短消息。")
+	b.WriteByte('\n')
+	b.WriteString(up.HistoryHeader)
+	b.WriteByte('\n')
+	b.WriteString(formatHistory(history, maxHistoryChars, up.NoHistoryText))
+	b.WriteByte('\n')
+	b.WriteString(up.Closing)
 	return b.String()
 }
 
 // formatHistory 把历史压成短文本；超过 maxChars 时按 UTF-8 字符边界截断。
-func formatHistory(history []*schema.Message, maxChars int) string {
+func formatHistory(history []*schema.Message, maxChars int, noHistoryText string) string {
 	if len(history) == 0 {
-		return "（无）\n"
+		return noHistoryText + "\n"
 	}
 	var b strings.Builder
 	for _, msg := range history {
@@ -187,7 +174,11 @@ func formatHistory(history []*schema.Message, maxChars int) string {
 		if content == "" {
 			continue
 		}
-		line := fmt.Sprintf("%s: %s\n", msg.Role, content)
+		role := string(msg.Role)
+		if msg.Name != "" {
+			role = fmt.Sprintf("%s(%s)", role, msg.Name)
+		}
+		line := fmt.Sprintf("%s: %s\n", role, content)
 		if maxChars > 0 && b.Len()+len(line) > maxChars {
 			remaining := maxChars - b.Len()
 			if remaining > 0 {
@@ -198,7 +189,7 @@ func formatHistory(history []*schema.Message, maxChars int) string {
 		b.WriteString(line)
 	}
 	if b.Len() == 0 {
-		return "（无）\n"
+		return noHistoryText + "\n"
 	}
 	return b.String()
 }
@@ -218,37 +209,41 @@ func truncateString(s string, maxBytes int) string {
 	return s
 }
 
-// humanConversationType 把会话类型翻成中文，减少模型理解内部枚举的成本。
-func humanConversationType(convType domain.ConversationType) string {
-	switch convType {
-	case domain.ConversationGroup:
-		return "群聊"
-	case domain.ConversationPrivate:
-		return "私聊"
-	default:
-		return string(convType)
+// humanConversationType 把会话类型翻成配置文案，减少模型理解内部枚举的成本。
+func humanConversationType(labels map[string]string, convType domain.ConversationType) string {
+	if label := labels[string(convType)]; label != "" {
+		return label
 	}
+	return string(convType)
 }
 
 // cleanGeneratedText 清理模型输出并拦截不应发送的片段。
 //
 // 它只做轻量规则：去掉外层引号、压平空白、检查禁用词；复杂安全判断仍由上游
 // guard 和模型提示词负责。
-func cleanGeneratedText(raw string) (string, error) {
+func cleanGeneratedText(raw string, forbidden []string) (string, error) {
 	text := strings.TrimSpace(raw)
-	if strings.Contains(text, "```") {
-		return "", fmt.Errorf("proactive: generated message contains forbidden fragment %q", "```")
+	if fragment, ok := containsForbiddenFragment(text, forbidden); ok {
+		return "", fmt.Errorf("proactive: generated message contains forbidden fragment %q", fragment)
 	}
 	text = strings.Trim(text, "\"'`“”‘’")
 	text = strings.Join(strings.Fields(text), " ")
 	if text == "" {
 		return "", fmt.Errorf("proactive: generated empty message")
 	}
-	lower := strings.ToLower(text)
-	for _, fragment := range forbiddenGeneratorFragments {
-		if strings.Contains(lower, strings.ToLower(fragment)) {
-			return "", fmt.Errorf("proactive: generated message contains forbidden fragment %q", fragment)
-		}
+	if fragment, ok := containsForbiddenFragment(text, forbidden); ok {
+		return "", fmt.Errorf("proactive: generated message contains forbidden fragment %q", fragment)
 	}
 	return text, nil
+}
+
+func containsForbiddenFragment(text string, forbidden []string) (string, bool) {
+	lower := strings.ToLower(text)
+	for _, fragment := range forbidden {
+		fragment = strings.TrimSpace(fragment)
+		if fragment != "" && strings.Contains(lower, strings.ToLower(fragment)) {
+			return fragment, true
+		}
+	}
+	return "", false
 }

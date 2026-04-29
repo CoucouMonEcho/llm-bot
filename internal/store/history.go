@@ -67,6 +67,7 @@ func NewHistoryRepo(cli *redis.Client) HistoryRepo {
 type historyEntry struct {
 	Role    string    `json:"role"`
 	Content string    `json:"content"`
+	Name    string    `json:"name,omitempty"`
 	Time    time.Time `json:"ts"`
 }
 
@@ -88,6 +89,7 @@ func (r *redisHistoryRepo) Append(ctx context.Context, sessionID string, msg *sc
 	entry := historyEntry{
 		Role:    string(msg.Role),
 		Content: msg.Content,
+		Name:    msg.Name,
 		Time:    time.Now(),
 	}
 	data, err := json.Marshal(entry)
@@ -132,10 +134,7 @@ func (r *redisHistoryRepo) Load(ctx context.Context, sessionID string, n int) ([
 			// 单条解析失败记录但不阻断；历史损坏不应让当前对话失败。
 			continue
 		}
-		msgs = append(msgs, &schema.Message{
-			Role:    schema.RoleType(entry.Role),
-			Content: entry.Content,
-		})
+		msgs = append(msgs, entry.message())
 	}
 	return msgs, nil
 }
@@ -143,4 +142,12 @@ func (r *redisHistoryRepo) Load(ctx context.Context, sessionID string, n int) ([
 // keyFor 构造某个 sessionID 对应的 Redis key。
 func (r *redisHistoryRepo) keyFor(sessionID string) string {
 	return r.keyPrefix + sessionID
+}
+
+func (e historyEntry) message() *schema.Message {
+	return &schema.Message{
+		Role:    schema.RoleType(e.Role),
+		Content: e.Content,
+		Name:    e.Name,
+	}
 }

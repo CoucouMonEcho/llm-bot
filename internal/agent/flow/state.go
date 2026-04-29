@@ -26,6 +26,9 @@ type Input struct {
 	Platform string
 	// SessionID 对话的唯一标识，用于 Redis key 和日志。
 	SessionID string
+	// ConvType 会话类型的字符串标识（例如 "private" / "group"）。
+	// Agent 层只用它判断是否需要群聊双写，不反向依赖 domain 包。
+	ConvType string
 	// UserID 触发本次消息的用户 ID。
 	// stats 中"按人头维度"的参数（好感度、未来的信任度等）都按 UserID 读写
 	// 而不是按 SessionID：群聊里一个 SessionID 对应多个 UserID，这些参数
@@ -35,9 +38,6 @@ type Input struct {
 	UserID string
 	// Query 用户的原始文本（已经去掉 @、前缀等触发标记）。
 	Query string
-	// UserName 触发用户的昵称。当前 Persona.BuildMessages 尚未消费此字段，
-	// 保留以便未来把称呼注入系统提示词或少样例（Few-shot）时使用。
-	UserName string
 }
 
 // VerdictKind 是一次防护判定的种类。零值 VerdictSafe 代表"未被任何防线拦截"，

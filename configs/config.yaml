@@ -33,6 +33,7 @@ judge:
 agent:
   history_size: 100                               # 单会话保留的最近历史条数
   prompt_file:  "configs/prompts/default.yaml"    # 人设 YAML 文件路径
+  empty_reply_fallback: "我去洗澡了"               # 主链清洗后为空时的兜底回复
 
 # 提示词注入防护（guard 复合节点读取）
 guard:
@@ -75,6 +76,7 @@ stats:
 # 默认关闭；即使打开 enabled，也建议先保持 dry_run 观察候选和限流行为。
 proactive:
   enabled: false
+  prompt_file: "configs/prompts/proactive.yaml"   # 主动消息生成提示词 YAML 文件路径
   window_start: "10:00"
   window_end: "01:00"
   min_since_last_inbound_sec: 3600    # 1h，避免刚聊完立刻追问

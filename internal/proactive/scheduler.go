@@ -226,7 +226,7 @@ func (s *Scheduler) RunOnce(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if !shouldSend(s.cfg.DryRun) {
+	if s.cfg.DryRun {
 		// DryRun 只产生日志，不发送消息，也不写入冷却、日限额或 PendingContext。
 		s.log.Info("proactive dry-run would send",
 			"platform", cand.Platform,
@@ -336,9 +336,4 @@ func nextDelay(interval, jitter time.Duration, int63n func(int64) int64) time.Du
 		return interval
 	}
 	return interval + time.Duration(int63n(maxJitter+1))
-}
-
-// shouldSend 把 DryRun 语义集中到一个小函数，测试里可以直接覆盖判断。
-func shouldSend(dryRun bool) bool {
-	return !dryRun
 }

@@ -190,14 +190,6 @@ func (m SessionMeta) ref() string {
 	return makeSessionRef(m.Platform, m.SessionID)
 }
 
-// lastSeen 把序列化时间还原为 time.Time；零值表示元数据缺少有效时间。
-func (m SessionMeta) lastSeen() time.Time {
-	if m.LastSeenUnix <= 0 {
-		return time.Time{}
-	}
-	return time.Unix(m.LastSeenUnix, 0)
-}
-
 // RecordSession 建立“用户 -> 会话”的反查索引，并刷新会话元数据。
 //
 // user_sessions 与 session_meta 使用相同 TTL：用户长期不再出现时，可触达索引

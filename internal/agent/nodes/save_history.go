@@ -33,21 +33,37 @@ func NewSaveHistory(repo store.HistoryRepo, historyMax int, logger *slog.Logger)
 			return st, nil
 		}
 
-		// 第一步：写入用户消息（使用原始 Query，不是 wrapper 后的）。
-		userMsg := schema.UserMessage(st.In.Query)
-		if err := repo.Append(ctx, st.In.SessionID, userMsg, historyMax); err != nil {
-			lg.Warn("append user message failed",
-				slog.String("session", st.In.SessionID),
-				slog.Any("err", err))
-			return st, nil // 不阻断回复发送
+		targets := []string{st.In.SessionID}
+		if st.In.ConvType == "group" && st.In.UserID != "" {
+			targets = append(targets, "private_"+st.In.UserID)
 		}
 
-		// 第二步：写入 assistant 回复。
-		if err := repo.Append(ctx, st.In.SessionID, st.Reply, historyMax); err != nil {
-			lg.Warn("append assistant message failed",
-				slog.String("session", st.In.SessionID),
-				slog.Any("err", err))
+		for _, sessionID := range targets {
+			appendTurn(ctx, repo, historyMax, lg, sessionID, st.In.Query, st.In.UserID, st.Reply.Content)
 		}
 		return st, nil
 	})
+}
+
+func appendTurn(ctx context.Context, repo store.HistoryRepo, historyMax int, lg *slog.Logger, sessionID, query, userID, reply string) {
+	// 第一步：写入用户消息（使用原始 Query，不是 wrapper 后的）。
+	userMsg := &schema.Message{
+		Role:    schema.User,
+		Content: query,
+		Name:    userID,
+	}
+	if err := repo.Append(ctx, sessionID, userMsg, historyMax); err != nil {
+		lg.Warn("append user message failed",
+			slog.String("session", sessionID),
+			slog.Any("err", err))
+		return // 不写半个 turn，但不阻断回复发送
+	}
+
+	// 第二步：写入 assistant 回复。
+	assistantMsg := schema.AssistantMessage(reply, nil)
+	if err := repo.Append(ctx, sessionID, assistantMsg, historyMax); err != nil {
+		lg.Warn("append assistant message failed",
+			slog.String("session", sessionID),
+			slog.Any("err", err))
+	}
 }

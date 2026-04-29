@@ -123,6 +123,10 @@ func main() {
 		if err != nil {
 			fatal("build proactive model: %v", err)
 		}
+		proactivePrompts, err := proactive.LoadGeneratorPrompts(cfg.Proactive.PromptFile)
+		if err != nil {
+			fatal("load proactive prompts: %v", err)
+		}
 		proactiveCfg = proactive.Config{
 			Enabled:     cfg.Proactive.Enabled,
 			WindowStart: cfg.Proactive.WindowStart,
@@ -146,6 +150,7 @@ func main() {
 			History: historyRepo,
 			Logger:  logger,
 			Config:  proactiveCfg.Generator,
+			Prompts: proactivePrompts,
 		})
 		logger.Info("proactive feature enabled", slog.Bool("dry_run", cfg.Proactive.DryRun))
 	}

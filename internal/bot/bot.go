@@ -128,9 +128,9 @@ func (b *Bot) handle(parent context.Context, m *domain.InboundMessage) {
 	in := &flow.Input{
 		Platform:  string(m.Platform),
 		SessionID: m.SessionID,
+		ConvType:  string(m.ConvType),
 		UserID:    m.UserID,
 		Query:     m.Text,
-		UserName:  m.UserName,
 	}
 
 	// 步骤 2：驱动 Graph。

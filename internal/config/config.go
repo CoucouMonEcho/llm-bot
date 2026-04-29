@@ -13,6 +13,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -51,6 +52,8 @@ type Stats struct {
 type Proactive struct {
 	// Enabled 是配置侧总开关；关闭时不构造主动消息调度链路。
 	Enabled bool `yaml:"enabled"`
+	// PromptFile 是主动消息生成提示词 YAML 文件路径；仅在 Enabled=true 时读取。
+	PromptFile string `yaml:"prompt_file"`
 	// WindowStart / WindowEnd 是每天允许主动发送的时间窗边界，格式为 HH:MM。
 	// 默认允许跨天窗口（例如 10:00 到 01:00），以覆盖深夜仍活跃的群。
 	WindowStart string `yaml:"window_start"`
@@ -155,6 +158,8 @@ type Agent struct {
 	HistorySize int `yaml:"history_size"`
 	// PromptFile 是人设 YAML 文件的路径（相对工作目录）。
 	PromptFile string `yaml:"prompt_file"`
+	// EmptyReplyFallback 是主链回复清洗后为空时发送的兜底文案。
+	EmptyReplyFallback string `yaml:"empty_reply_fallback"`
 }
 
 // Guard 描述提示词注入防护相关参数。
@@ -259,6 +264,10 @@ func (c *Config) validate() error {
 	if c.Agent.HistorySize <= 0 {
 		c.Agent.HistorySize = 20
 	}
+	c.Agent.EmptyReplyFallback = strings.TrimSpace(c.Agent.EmptyReplyFallback)
+	if c.Agent.EmptyReplyFallback == "" {
+		c.Agent.EmptyReplyFallback = "我去洗澡了"
+	}
 	if len(c.Guard.FallbackReplies) == 0 {
 		return fmt.Errorf("config: guard.fallback_replies must contain at least one entry")
 	}
@@ -271,6 +280,7 @@ func (c *Config) validate() error {
 func defaultProactive() Proactive {
 	return Proactive{
 		Enabled:                false,
+		PromptFile:             "configs/prompts/proactive.yaml",
 		WindowStart:            "10:00",
 		WindowEnd:              "01:00",
 		MinSinceLastInboundSec: int((1 * time.Hour) / time.Second),
@@ -288,6 +298,10 @@ func defaultProactive() Proactive {
 
 func (c *Config) validateProactive() error {
 	defaults := defaultProactive()
+	c.Proactive.PromptFile = strings.TrimSpace(c.Proactive.PromptFile)
+	if c.Proactive.PromptFile == "" {
+		c.Proactive.PromptFile = defaults.PromptFile
+	}
 	if c.Proactive.WindowStart == "" {
 		c.Proactive.WindowStart = defaults.WindowStart
 	}
