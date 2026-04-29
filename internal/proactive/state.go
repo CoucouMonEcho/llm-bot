@@ -365,9 +365,19 @@ func makeUserKey(platform domain.Platform, userID string) string {
 	return p + "_" + userID
 }
 
-// makeSessionRef 给会话元数据构造跨平台引用，分隔符避开 user key 的下划线格式。
+// makeSessionRef 给会话元数据构造跨平台引用。
+//
+// sessionID 自身已带 "private_" / "group_" 前缀，platform 在前再加下划线即可
+// 区分。统一用 "_" 拼接和 makeUserKey 保持一致，方便排查时眼睛省事；
+// 本包不会反向 split ref，所以不用担心与 user key 撞串——它们出现在不同的
+// Redis 容器（user key 是 ZSET member / key 后缀，session ref 是 Hash field /
+// Set member），值相等也不会被错配。
 func makeSessionRef(platform domain.Platform, sessionID string) string {
-	return string(platform) + "|" + sessionID
+	p := string(platform)
+	if p == "" {
+		p = "unknown"
+	}
+	return p + "_" + sessionID
 }
 
 // normalizeGroupSessionID 兼容管理命令只输入群号的情况，内部统一存 group_ 前缀。

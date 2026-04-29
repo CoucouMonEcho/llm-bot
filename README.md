@@ -126,12 +126,12 @@ GET bot_memory_onebot_123456
 | `bot_proactive_group_whitelist` | Set | 允许唤起的 `group_<id>` | 永不过期 |
 | `bot_proactive_user_last_inbound` | ZSET | member=`<platform>_<userID>`，score=最近活跃 Unix 秒 | 永不过期 |
 | `bot_proactive_whitelist_group_events` | List | 白名单群最近入站消息 JSON | 长度封顶 `recent_events_cap` |
-| `bot_proactive_last_proactive_at` | Hash | field=<code>&lt;platform&gt;&#124;&lt;sessionID&gt;</code>，value=最近主动发送 Unix 秒 | 永不过期 |
-| `bot_proactive_user_sessions_<platform>_<userID>` | Set | 用户出现过的 <code>&lt;platform&gt;&#124;&lt;sessionID&gt;</code> 集合 | 30d 滑动 |
-| <code>bot_proactive_session_meta_&lt;platform&gt;&#124;&lt;sessionID&gt;</code> | Hash | platform / conv\_type / session\_id / last\_user\_id / last\_user\_name / last\_seen\_unix | 30d 滑动 |
+| `bot_proactive_last_proactive_at` | Hash | field=`<platform>_<sessionID>`，value=最近主动发送 Unix 秒 | 永不过期 |
+| `bot_proactive_user_sessions_<platform>_<userID>` | Set | 用户出现过的 `<platform>_<sessionID>` 集合 | 30d 滑动 |
+| `bot_proactive_session_meta_<platform>_<sessionID>` | Hash | platform / conv\_type / session\_id / last\_user\_id / last\_user\_name / last\_seen\_unix | 30d 滑动 |
 | `bot_proactive_daily_count_<YYYYMMDD>` | String | 当日发送计数 | 48h |
 
-> 命名细节：`session_meta` 与 `last_proactive_at` 内部使用 `|` 分隔 platform 和 sessionID，避开 user key 的 `_` 格式（不会和 `onebot_123` 撞车）；其他 key 全是 `_`。
+> `<sessionID>` 自带 `private_` / `group_` 前缀，所以 `session_meta` 等 key 形如 `bot_proactive_session_meta_onebot_group_789012`、`bot_proactive_session_meta_onebot_private_123456`。
 
 运行期管理无内置命令，直接 `redis-cli`：
 
@@ -145,12 +145,12 @@ SREM  bot_proactive_group_whitelist group_789012  # 移除
 排查 "现在该唤起谁、能不能发"：
 
 ```bash
-ZREVRANGE bot_stats_affinity_rank 0 9 WITHSCORES        # 候选 Top10
-ZSCORE    bot_proactive_user_last_inbound onebot_123    # 这个人上次说话什么时候
-SMEMBERS  bot_proactive_user_sessions_onebot_123        # 他出现过的会话 ref
-HGETALL   "bot_proactive_session_meta_onebot|group_789" # 这个会话还活不活
-HGET      bot_proactive_last_proactive_at "onebot|group_789"  # 上一次主动发送
-GET       "bot_proactive_daily_count_$(date +%Y%m%d)"   # 今天已发送次数
+ZREVRANGE bot_stats_affinity_rank 0 9 WITHSCORES                 # 候选 Top10
+ZSCORE    bot_proactive_user_last_inbound onebot_123             # 这个人上次说话什么时候
+SMEMBERS  bot_proactive_user_sessions_onebot_123                 # 他出现过的会话 ref
+HGETALL   bot_proactive_session_meta_onebot_group_789            # 这个会话还活不活
+HGET      bot_proactive_last_proactive_at onebot_group_789       # 上一次主动发送
+GET       "bot_proactive_daily_count_$(date +%Y%m%d)"            # 今天已发送次数
 ```
 
 ## 运行
