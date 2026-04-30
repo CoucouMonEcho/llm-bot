@@ -1,12 +1,12 @@
 // Package proactive 的 scheduler.go 实现主动消息调度循环。
 //
 // 调度器按固定间隔加随机抖动运行：先检查 Redis 运行期开关与时间窗，再扫
-// 一遍"群最后活跃时间" HASH，挑出最久未活跃且超过冷却阈值的群，生成开场
-// 白发出去，最后回写 last_inbound 防自激发。
+// 一遍"bot 群内最后发言时间" HASH，挑出 bot 最久未开口且超过冷却阈值的群，
+// 生成开场白发出去，最后回写本次发言时间。
 //
 // 决策面只剩"群冷却 + 时间窗 + Redis 开关"三件事——日限额、会话冷却、
 // 好感度排行、白名单等已被刻意删除：群冷却本身已经是足够的频率约束，
-// "群里 1h 没人说话才主动开口"在直觉上也容易解释。
+// "bot 在群里 1h 没说话才主动开口"在直觉上也容易解释。
 package proactive
 
 import (
@@ -139,8 +139,8 @@ func (s *Scheduler) Run(ctx context.Context) {
 
 // RunOnce 执行一轮调度；生产路径通常由 Run 调用，测试和管理命令可直接使用。
 //
-// 流程：开关 → 时间窗 → 扫 hash → 选最旧 → 生成 → 发 → 写历史 → 回写 last_inbound。
-// 任意短路点都会直接 return nil；历史写入失败只记录 warn，不阻断防自激发回写。
+// 流程：开关 → 时间窗 → 扫 hash → 选最旧 → 生成 → 发 → 写历史 → 回写发言时间。
+// 任意短路点都会直接 return nil；历史写入失败只记录 warn，不阻断发言时间回写。
 // 本轮至多发一个群，下轮再处理其他群——避免一次循环里把所有沉寂群轮一遍。
 func (s *Scheduler) RunOnce(ctx context.Context) error {
 	if s == nil {
@@ -170,7 +170,7 @@ func (s *Scheduler) RunOnce(ctx context.Context) error {
 		return nil
 	}
 
-	groups, err := s.state.GroupsLastInbound(ctx)
+	groups, err := s.state.GroupsLastBotSpoke(ctx)
 	if err != nil {
 		return err
 	}
@@ -208,14 +208,13 @@ func (s *Scheduler) RunOnce(ctx context.Context) error {
 		}
 	}
 
-	// 防自激发：发完即视作"群里和 bot 又互动了一次"，等同一条群消息进来。
-	if err := s.state.RecordGroupInbound(ctx, sessionID, sentAt); err != nil {
+	if err := s.state.RecordGroupBotSpoke(ctx, sessionID, sentAt); err != nil {
 		return err
 	}
 
 	s.log.Info("proactive message sent",
 		"session", sessionID,
-		"idle", sentAt.Sub(lastAt))
+		"bot_silence", sentAt.Sub(lastAt))
 	return nil
 }
 

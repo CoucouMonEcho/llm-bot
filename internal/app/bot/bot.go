@@ -35,15 +35,14 @@ const sendDeadlineReserve = 300 * time.Millisecond
 
 // Bot 聚合 Adapter 与 Runnable，是整个服务的"大主循环"载体。
 //
-// activityRecorder 直接持有 *proactive.ActivityRecorder：由 main 装配，恒非
-// nil；这条旁路记录的具体写入行为（Redis key、白名单、软降级）都收敛在
-// proactive 包里。
+// proactiveState 只记录 bot 成功发出的群消息；主动调度据此判断 bot 在群里
+// 已经沉默了多久。
 type Bot struct {
 	adapter  adapter.Adapter
 	runnable agent.Runnable
 	logger   *slog.Logger
 
-	activityRecorder *proactive.ActivityRecorder
+	proactiveState *proactive.State
 
 	// groupBuffer 是"群聊短期上下文"的写入端，可为 nil。
 	// 为 nil 时表示该功能在 main 装配阶段被关闭，Bot 完全不调用，
@@ -68,14 +67,14 @@ type followupKey struct {
 // New 构造一个 Bot。
 //
 // ad 可以是任何满足 adapter.Adapter 的实现；rn 是 agent.Build 的返回值。
-// recorder 由 main 装配，恒非 nil；运行期是否真的发主动消息由 Redis
-// `bot_proactive_enabled` 决定。stats 打分由 Agent Graph 的 scoreStats
-// 节点在"回复已生成"时触发，Bot 只负责发送。
+// proactiveState 由 main 装配，运行期是否真的发主动消息由 Redis
+// `bot_proactive_enabled` 决定。stats 打分由 Agent Graph 的 scoreStats 节点在
+// "回复已生成"时触发，Bot 只负责发送。
 //
 // groupBuffer 可为 nil：为 nil 时 Bot 完全不调用，等价于关闭"群聊短期
 // 上下文缓存"；非 nil 时仅在 follow-up gate 拦下的群聊普通消息上做一次
 // 旁路 Append——具体见 cacheGroupBackground 注释。
-func New(ad adapter.Adapter, rn agent.Runnable, recorder *proactive.ActivityRecorder, groupBuffer store.GroupBufferRepo, logger *slog.Logger, trigger config.Trigger) *Bot {
+func New(ad adapter.Adapter, rn agent.Runnable, proactiveState *proactive.State, groupBuffer store.GroupBufferRepo, logger *slog.Logger, trigger config.Trigger) *Bot {
 	followupWindow := time.Duration(trigger.GroupFollowupSec) * time.Second
 	if followupWindow < 0 {
 		followupWindow = 0
@@ -84,7 +83,7 @@ func New(ad adapter.Adapter, rn agent.Runnable, recorder *proactive.ActivityReco
 		adapter:                 ad,
 		runnable:                rn,
 		logger:                  logger.With(slog.String("component", "bot")),
-		activityRecorder:        recorder,
+		proactiveState:          proactiveState,
 		groupBuffer:             groupBuffer,
 		followupWindow:          followupWindow,
 		followups:               make(map[followupKey]time.Time),
@@ -149,10 +148,6 @@ func (b *Bot) handle(parent context.Context, m *domain.InboundMessage) {
 		slog.String("session", m.SessionID),
 		slog.String("user", m.UserID))
 
-	// 先记录活跃再进 Graph：即便后续 LLM 调用失败，"这个人刚来过"仍是事实。
-	// 记录接口不返回错误，主动消息索引故障只在实现侧降级。
-	b.activityRecorder.RecordInbound(ctx, m)
-
 	if !b.shouldInvokeGraph(m, receivedAt) {
 		b.cacheGroupBackground(ctx, m)
 		lg.Debug("message skipped by follow-up gate")
@@ -204,7 +199,9 @@ func (b *Bot) handle(parent context.Context, m *domain.InboundMessage) {
 		lg.Error("adapter send failed", slog.Any("err", err))
 		return
 	}
-	b.refreshFollowup(m, b.currentTime())
+	sentAt := b.currentTime()
+	b.recordGroupBotSpoke(ctx, m, sentAt)
+	b.refreshFollowup(m, sentAt)
 
 	// 步骤 4：观测日志——被拦截的路径走 info 以便线上报警，正常路径降到 debug
 	// 避免刷屏。被拦截的具体细节（命中的 pattern、裁判输出）由产生它的节点
@@ -224,6 +221,20 @@ func (b *Bot) currentTime() time.Time {
 		return b.now()
 	}
 	return time.Now()
+}
+
+func (b *Bot) recordGroupBotSpoke(ctx context.Context, m *domain.InboundMessage, sentAt time.Time) {
+	if b.proactiveState == nil || m == nil {
+		return
+	}
+	if m.ConvType != domain.ConversationGroup || m.SessionID == "" {
+		return
+	}
+	if err := b.proactiveState.RecordGroupBotSpoke(ctx, m.SessionID, sentAt); err != nil {
+		b.logger.Warn("proactive record group bot spoke failed",
+			slog.String("session", m.SessionID),
+			slog.Any("err", err))
+	}
 }
 
 // OpenProactiveFollowup 打开"主动群发后的首个回应"窗口。

@@ -8,9 +8,9 @@
 - **前置注入裁判**：独立 LLM 裁判先判断输入，只有明确输出 `safe` 才读取上下文并调用主模型；非安全输入会静默不回复。
 - **人设参数 stats**：好感度按 "平台+用户" 维度累计、心情全局共享并按沉默时长自然回归；每轮回复后异步打分写回 Redis。
 - **长期记忆**：按 "平台+用户" 保存压缩事实摘要；回复后异步合并更新，与短期对话历史分离。
-- **群聊触发策略**：普通群文本也会进入 `Bot`，用于记录真实群活跃；`Bot` 只在 @ / 前缀等显式触发，或短时间连续对话窗口内，把消息送进 Agent Graph。
+- **群聊触发策略**：普通群文本也会进入 `Bot`；`Bot` 只在 @ / 前缀等显式触发，或短时间连续对话窗口内，把消息送进 Agent Graph。
 - **群聊短期上下文**：未触发 Graph 的普通群文本被 `Bot` 写入一条 Redis List（`LPUSH+LTRIM+EXPIRE`，单群最多 20 条 / 10 分钟）；下次 @bot 时由 `loadContext` 直读全量并渲染成 system prompt 里的"刚才群里在聊什么"块，不进个人 history、不污染 stats / memory。
-- **主动发消息**（默认关闭）：扫一遍"群最后活跃时间"HASH，挑出冷却超过 1h 的群发条短消息；发送成功后写入群历史，时间窗与 Redis 总开关收口在调度器。
+- **主动发消息**（默认关闭）：扫一遍"bot 群内最后发言时间"HASH，挑出 bot 沉默超过 1h 的群发条短消息；发送成功后写入群历史，时间窗与 Redis 总开关收口在调度器。
 - **OpenAI 兼容**：主模型与 judge 都走 OpenAI Chat Completions 协议；DeepSeek、Qwen 兼容模式、OneAPI、Ollama 都能直连。
 
 软降级是通用约定：stats / memory / proactive 失败只打日志，永远不阻断对话主链。
@@ -22,9 +22,8 @@ flowchart LR
     NapCat[NapCatQQ] -- "反向 WS" --> Adapter
     Adapter -->|InboundMessage| Bot
     Bot -->|显式触发 / 连续对话| Graph[Agent Graph]
-    Bot -.->|旁路| Recorder[ActivityRecorder]
     Graph -->|OutboundMessage| Adapter
-    Recorder --> Redis[(Redis)]
+    Bot -.->|群发送成功| Redis[(Redis)]
     Scheduler --> Generator --> Adapter
     Redis --> Scheduler
 ```
@@ -58,7 +57,7 @@ flowchart TD
 
 静默中断路径由节点返回 `ErrSkipReply` 触发；Graph 中断后不会进入 `saveHistory` / `updateMemory` / `scoreStats`。
 
-主动消息侧路完全独立：`Bot` 把每条**群**入站消息（包括未触发 Graph 的普通群文本）旁路写入 `proactive.ActivityRecorder`（HSET `bot_proactive_group_last_inbound`）；`Scheduler` 后台轮询 → 扫这份 HASH 选真实群活跃最久未更新且超过 idle 阈值的群 → `Generator` 拉同群最近几条历史作语气参考 → 生成开场白 → 同一个 `Adapter.Send` 发出 → 发完写入一条 assistant-only 群历史并回写 last_inbound 防自激发。
+主动消息侧路完全独立：`Bot` 在群消息发送成功后记录 bot 本次开口时间；`Scheduler` 后台轮询 → 扫这份 HASH 选 bot 最久未开口且超过 idle 阈值的群 → `Generator` 拉同群最近几条历史作语气参考 → 生成开场白 → 同一个 `Adapter.Send` 发出 → 发完写入一条 assistant-only 群历史并回写本次开口时间。
 
 ### 目录
 
@@ -74,7 +73,7 @@ internal/
 ├── llmtext/        共享小工具：加载 prompt、剥 markdown 代码块
 ├── memory/         长期记忆 Store + 异步更新
 ├── platform/       IM 抽象 + OneBot v11 反向 WS 实现
-├── proactive/      State / Recorder / Generator / Scheduler
+├── proactive/      State / Generator / Scheduler
 └── stats/          好感度 / 心情 Store + 异步打分
 ```
 
@@ -130,17 +129,17 @@ GET bot_memory_onebot_123456
 | Key | 类型 | 内容 | TTL |
 |-----|------|------|-----|
 | `bot_proactive_enabled` | String | `"true"` / `"false"`，运行期总开关 | 永不过期 |
-| `bot_proactive_group_last_inbound` | Hash | field=`group_<id>`，value=最近一次真实群活跃的 Unix 秒 | 永不过期 |
+| `bot_proactive_group_last_spoke` | Hash | field=`group_<id>`，value=bot 最近一次在该群发言的 Unix 秒 | 永不过期 |
 
-`bot_proactive_group_last_inbound` 同时承担两份语义：HKEYS 即"已知群集合"，HVALS 即"该群上次真实活跃时间"。一份 HASH 是写入面（`ActivityRecorder` 收到任意群入站消息时刷新、`Scheduler` 发送成功后回写防自激发）也是读取面（`Scheduler` HGETALL 一次拿到全部决策依据）。冷启动时该 HASH 不存在，调度器自然不发消息；机器人首次观察到群消息后，该群从那一刻起进入候选。
+`bot_proactive_group_last_spoke` 是写入面也是读取面：`Bot` 被动群回复发送成功后刷新，`Scheduler` 主动群消息发送成功后也刷新；调度器 HGETALL 一次拿到全部候选群与上次开口时间。冷启动时该 HASH 不存在，调度器自然不发消息；bot 在某个群里成功说过话后，该群从那一刻起进入候选。
 
 运行期管理无内置命令，直接 `redis-cli`：
 
 ```bash
 SET     bot_proactive_enabled true                  # 打开
 DEL     bot_proactive_enabled                       # 关闭
-HGETALL bot_proactive_group_last_inbound            # 看当前已知群与最后活跃时间
-HDEL    bot_proactive_group_last_inbound group_789  # 把某个群从候选中清除
+HGETALL bot_proactive_group_last_spoke              # 看候选群与 bot 上次开口时间
+HDEL    bot_proactive_group_last_spoke group_789    # 把某个群从候选中清除
 ```
 
 ## 运行

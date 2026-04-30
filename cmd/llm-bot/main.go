@@ -145,13 +145,12 @@ func main() {
 
 	// 步骤 9：构造主动消息组件。
 	// 主动消息组件始终构造，运行期由 Redis bot_proactive_enabled 控制是否真发；
-	// Bot 层拿到具体的 *proactive.ActivityRecorder 用来旁路记录真实入站活跃，
-	// 群冷却阈值、时间窗与 Redis key 都留在 proactive 包内。
+	// Bot 层在群消息发送成功后记录 bot 开口时间，群冷却阈值、时间窗与 Redis
+	// key 都留在 proactive 包内。
 	// Scheduler 在 Adapter start 之后再启动，因为它需要把生成结果通过同一个
 	// Adapter 发回平台。
 	proactiveState := proactive.NewState(redisCli, logger)
-	activityRecorder := proactive.NewActivityRecorder(proactiveState, logger)
-	b := bot.New(ad, runnable, activityRecorder, groupBuffer, logger, cfg.Trigger)
+	b := bot.New(ad, runnable, proactiveState, groupBuffer, logger, cfg.Trigger)
 	proactiveScheduler, err := buildProactiveScheduler(ctx, cfg, proactiveState, historyRepo, ad, b.OpenProactiveFollowup, logger)
 	if err != nil {
 		fatal("%v", err)

@@ -10,7 +10,7 @@ import (
 // GeneratorPrompts 是主动消息生成器的文本契约。
 //
 // 加载一次即固化到内存。当前主动消息只面向群聊，因此 user prompt 由
-// "当前时间 + 群里上次活跃时间 + 历史"三块组成。
+// "当前时间 + bot 上次开口时间 + 历史"三块组成。
 //
 // Examples 只保存"期望输出长什么样"的 assistant 正例字符串列表；运行期会被
 // 渲染成 system prompt 里的结构化 few-shot 段落，而不是伪造多轮 user/assistant
@@ -28,11 +28,11 @@ type GeneratorPrompts struct {
 // 字段会在 normalized 时校验非空——所有 label 都是契约的一部分，缺一项就
 // 让装配期直接失败，避免运行期才发现 prompt 拼出空字符串。
 type GeneratorUserPrompt struct {
-	CurrentTimeLabel   string
-	LastInboundAtLabel string
-	HistoryHeader      string
-	NoHistoryText      string
-	Closing            string
+	CurrentTimeLabel string
+	LastSpokeAtLabel string
+	HistoryHeader    string
+	NoHistoryText    string
+	Closing          string
 }
 
 func LoadGeneratorPrompts(path string) (GeneratorPrompts, error) {
@@ -117,11 +117,11 @@ func parseGeneratorUserPrompt(section string) (GeneratorUserPrompt, error) {
 		values[strings.TrimSpace(key)] = strings.TrimSpace(value)
 	}
 	return GeneratorUserPrompt{
-		CurrentTimeLabel:   values["current_time_label"],
-		LastInboundAtLabel: values["last_inbound_at_label"],
-		HistoryHeader:      values["history_header"],
-		NoHistoryText:      values["no_history_text"],
-		Closing:            values["closing"],
+		CurrentTimeLabel: values["current_time_label"],
+		LastSpokeAtLabel: values["last_spoke_at_label"],
+		HistoryHeader:    values["history_header"],
+		NoHistoryText:    values["no_history_text"],
+		Closing:          values["closing"],
 	}, nil
 }
 
@@ -145,7 +145,7 @@ func (p GeneratorPrompts) normalized() (GeneratorPrompts, error) {
 		value *string
 	}{
 		{"用户提示模板 current_time_label", &up.CurrentTimeLabel},
-		{"用户提示模板 last_inbound_at_label", &up.LastInboundAtLabel},
+		{"用户提示模板 last_spoke_at_label", &up.LastSpokeAtLabel},
 		{"用户提示模板 history_header", &up.HistoryHeader},
 		{"用户提示模板 no_history_text", &up.NoHistoryText},
 		{"用户提示模板 closing", &up.Closing},

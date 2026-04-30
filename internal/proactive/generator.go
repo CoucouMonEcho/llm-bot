@@ -59,10 +59,10 @@ func NewGenerator(opts GeneratorOptions) *Generator {
 
 // Generate 为某个群生成一条可直接发送的主动开场白。
 //
-// 入参只保留三件事：群 sessionID、群里上一次互动时间、当前时间。生成结果
+// 入参只保留三件事：群 sessionID、bot 上次开口时间、当前时间。生成结果
 // 经过 cleanGeneratedText 清理和敏感片段检查；不合格时返回错误，调度器会
 // 放弃本轮发送。
-func (g *Generator) Generate(ctx context.Context, sessionID string, lastInboundAt, now time.Time) (string, error) {
+func (g *Generator) Generate(ctx context.Context, sessionID string, lastSpokeAt, now time.Time) (string, error) {
 	if g == nil || g.model == nil {
 		return "", fmt.Errorf("proactive: nil generator model")
 	}
@@ -76,7 +76,7 @@ func (g *Generator) Generate(ctx context.Context, sessionID string, lastInboundA
 	}
 	messages := []*schema.Message{
 		schema.SystemMessage(buildSystemPrompt(g.prompts)),
-		schema.UserMessage(buildGeneratorPrompt(g.prompts, now, lastInboundAt, history, g.maxHistoryChars)),
+		schema.UserMessage(buildGeneratorPrompt(g.prompts, now, lastSpokeAt, history, g.maxHistoryChars)),
 	}
 	reply, err := g.model.Generate(ctx, messages)
 	if err != nil {
@@ -126,12 +126,12 @@ func buildSystemPrompt(prompts GeneratorPrompts) string {
 }
 
 // buildGeneratorPrompt 组装主动消息生成任务的用户消息。
-func buildGeneratorPrompt(prompts GeneratorPrompts, now, lastInboundAt time.Time, history []*schema.Message, maxHistoryChars int) string {
+func buildGeneratorPrompt(prompts GeneratorPrompts, now, lastSpokeAt time.Time, history []*schema.Message, maxHistoryChars int) string {
 	var b strings.Builder
 	up := prompts.UserPrompt
 	_, _ = fmt.Fprintf(&b, "%s%s\n", up.CurrentTimeLabel, now.Format(time.RFC3339))
-	if !lastInboundAt.IsZero() {
-		_, _ = fmt.Fprintf(&b, "%s%s\n", up.LastInboundAtLabel, lastInboundAt.Format(time.RFC3339))
+	if !lastSpokeAt.IsZero() {
+		_, _ = fmt.Fprintf(&b, "%s%s\n", up.LastSpokeAtLabel, lastSpokeAt.Format(time.RFC3339))
 	}
 	b.WriteByte('\n')
 	b.WriteString(up.HistoryHeader)

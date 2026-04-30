@@ -85,6 +85,6 @@ proactive:
   prompt_file: "configs/prompts/persona/generator.md"
   window_start: "10:00"
   window_end: "01:00"
-  interval_sec: 600         # 每轮等待 10 分钟
+  interval_sec: 300         # 每轮等待 5 分钟
   jitter_max_sec: 60        # 抖动上限 1 分钟
   idle_threshold_sec: 3600  # 群里 1h 没人说话才主动开口

@@ -90,7 +90,7 @@ type Proactive struct {
 	IntervalSec int `yaml:"interval_sec"`
 	// JitterMaxSec 是每轮调度额外随机等待的上限，用来打散固定整点发送痕迹。
 	JitterMaxSec int `yaml:"jitter_max_sec"`
-	// IdleThresholdSec 是"群里多久没人说话才主动开口"的阈值。
+	// IdleThresholdSec 是 bot 在群里沉默多久才主动开口的阈值。
 	IdleThresholdSec int `yaml:"idle_threshold_sec"`
 }
 

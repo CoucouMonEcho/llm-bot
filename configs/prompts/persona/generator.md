@@ -54,7 +54,7 @@
 ## 用户提示模板
 
 - current_time_label: 当前时间：
-- last_inbound_at_label: 群里上次有人说话的时间：
+- last_spoke_at_label: bot 上次在本群说话的时间：
 - history_header: 本群最近的对话历史（只用于感受氛围，不要引用或复述）：
 - no_history_text: （无）
 - closing: 请写一条像非人随口冒泡的极短群消息。
