@@ -1,4 +1,4 @@
-// Package guard 的 judge.go 是"第二级防线"：基于独立 LLM 的注入攻击分类器。
+// Package guard 的 judge.go 实现基于独立 LLM 的注入攻击分类器。
 //
 // 为什么用独立模型：
 //  1. 主模型可能被人设 system prompt 引导去"扮演角色"，在面对注入时判断力弱；
@@ -11,7 +11,7 @@
 //   - 裁判 prompt 在启动时从 YAML 加载并固化到内存，运行期不再 IO；
 //   - 裁判只输出 "safe" / "attack" 两个 token，极短回复节省 token 费用；
 //   - 模型输出不可完全信任：如果出现既不是 safe 也不是 attack 的字符串，
-//     一律按"safe"处理（bias towards availability）。
+//     一律按"非 safe"处理。删掉同步正则层后，只有明确 safe 才能进入主链。
 package guard
 
 import (
@@ -26,9 +26,9 @@ import (
 )
 
 // 裁判内部的两个判定 token。模型只能输出这两个字符串之一；
-// 其余任何输出都被规范化为 "safe"（bias towards availability）。
+// 其余任何输出都按"非 safe"处理。
 //
-// 故意不把它们暴露成导出常量——对上层而言 Classify 只是一个 bool。
+// 故意不把它们暴露成导出常量——对上层而言 Classify 只关心能否放行。
 const (
 	judgeTokenSafe   = "safe"
 	judgeTokenAttack = "attack"
@@ -72,14 +72,12 @@ func NewJudge(m model.BaseChatModel, systemPrompt string) *Judge {
 // 上游取消时裁判请求也会一起取消。裁判只负责输入侧判定，不与主聊天模型并发。
 //
 // 返回值语义：
-//   - attack==true 表示被判定为注入攻击，调用方应走降级分支；
-//   - attack==false 表示放行，或模型返回了无法识别的字符串（保守放行）；
-//   - 网络错误 / ctx cancel 时返回 (false, err)——保守处理：
-//     裁判不可用时默认放行，由其他防线兜底。
+//   - safe==true 仅表示模型明确输出 safe，调用方可以进入主链；
+//   - safe==false 表示 attack、未知输出、空输出或其它非 safe 文本；
+//   - 网络错误 / ctx cancel 时返回 (false, err)，调用方按 fail-closed 处理。
 //
-// 选择 bool 而非枚举：Judge 语义上只有二元结论，一个 bool 足矣；
-// 拦截种类由调用节点写入 flow.State.VerdictKind。
-func (j *Judge) Classify(ctx context.Context, input string) (attack bool, err error) {
+// 选择 bool 而非枚举：删掉正则层后，业务只需要回答"能否放行"。
+func (j *Judge) Classify(ctx context.Context, input string) (safe bool, err error) {
 	messages := []*schema.Message{
 		schema.SystemMessage(j.systemPrompt),
 		schema.UserMessage("<input>\n" + input + "\n</input>"),
@@ -93,12 +91,12 @@ func (j *Judge) Classify(ctx context.Context, input string) (attack bool, err er
 	content = strings.Trim(content, "\"'. \n\t")
 
 	switch content {
-	case judgeTokenAttack:
-		return true, nil
 	case judgeTokenSafe:
+		return true, nil
+	case judgeTokenAttack:
 		return false, nil
 	default:
-		// 未预期的输出 → 保守放行，由其他防线兜底。
+		// 未预期的输出不能再放行；删掉正则层后，只有明确 safe 才进主链。
 		return false, nil
 	}
 }

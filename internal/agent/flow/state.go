@@ -39,8 +39,8 @@ type Input struct {
 	Query string
 }
 
-// VerdictKind 是一次防护判定的种类。零值 VerdictSafe 代表"未被任何防线拦截"，
-// 这使得 State 零值即等价于"放行"，Graph 的起始节点无需显式初始化。
+// VerdictKind 是一次裁判判定的种类。零值 VerdictSafe 代表"裁判明确放行"，
+// 这使得 State 零值即等价于"正常主链"。
 //
 // 拦截理由的细节（命中的 pattern、裁判输出等）由产生它的节点当场打日志，
 // 不再随 State 流转——细节只对当时排查的人有用，外化成字段反而会让 Graph
@@ -50,9 +50,7 @@ type VerdictKind int
 const (
 	// VerdictSafe 未被任何防线拦截——正常走主链并落历史。
 	VerdictSafe VerdictKind = iota
-	// VerdictRegex 被第一级同步正则黑名单命中。
-	VerdictRegex
-	// VerdictJudge 被第二级 LLM 裁判判定为攻击。
+	// VerdictJudge 未被 LLM 裁判明确判为 safe。
 	VerdictJudge
 )
 
@@ -61,8 +59,6 @@ func (k VerdictKind) String() string {
 	switch k {
 	case VerdictSafe:
 		return "safe"
-	case VerdictRegex:
-		return "regex"
 	case VerdictJudge:
 		return "judge"
 	default:

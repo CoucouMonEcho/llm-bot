@@ -84,12 +84,9 @@ func main() {
 		fatal("load persona: %v", err)
 	}
 
-	var judgePrompt string
-	if cfg.Guard.JudgeEnabled {
-		judgePrompt, err = guard.LoadJudgePrompt(cfg.Guard.JudgePromptFile)
-		if err != nil {
-			fatal("load judge prompt: %v", err)
-		}
+	judgePrompt, err := guard.LoadJudgePrompt(cfg.Guard.JudgePromptFile)
+	if err != nil {
+		fatal("load judge prompt: %v", err)
 	}
 
 	// 步骤 5：stats / memory 都用 cfg.Judge 做异步打分 / 摘要更新；只有任一启用时

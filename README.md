@@ -4,8 +4,8 @@
 
 ## 功能
 
-- **被动回复**：用 [eino](https://github.com/cloudwego/eino) `compose.Graph` 把 11 个节点串成一条带分支的回复链路，所有控制流（拦截、低状态不回复、降级、收尾副作用）都体现在拓扑而非 if-else 里。
-- **两级注入防护**：同步正则黑名单先粗筛；放行后先由独立 LLM 裁判前置判断，安全时才读取上下文并调用主模型。
+- **被动回复**：用 [eino](https://github.com/cloudwego/eino) `compose.Graph` 把 10 个节点串成一条带分支的回复链路，所有控制流（拦截、低状态不回复、降级、收尾副作用）都体现在拓扑而非 if-else 里。
+- **前置注入裁判**：独立 LLM 裁判先判断输入，只有明确输出 `safe` 才读取上下文并调用主模型；裁判错误或非预期输出都会走降级路径。
 - **人设参数 stats**：好感度按 "平台+用户" 维度累计、心情全局共享并按沉默时长自然回归；每轮回复后异步打分写回 Redis。
 - **长期记忆**：按 "平台+用户" 保存压缩事实摘要；回复后异步合并更新，与短期对话历史分离。
 - **群聊触发策略**：普通群文本也会进入 `Bot`，用于记录真实群活跃；`Bot` 只在 @ / 前缀等显式触发，或短时间连续对话窗口内，把消息送进 Agent Graph。
@@ -33,11 +33,9 @@ flowchart LR
 
 ```mermaid
 flowchart TD
-    START([START]) --> regexGate
-    regexGate -- safe --> judgeGate
-    regexGate -- blocked --> fallback
+    START([START]) --> judgeGate
     judgeGate -- safe --> loadContext
-    judgeGate -- blocked --> fallback
+    judgeGate -- "non-safe" --> fallback
     loadContext --> lowStateGate --> buildMessages --> chatModel
     chatModel --> postproc
     postproc --> saveHistory --> updateMemory --> scoreStats
@@ -47,8 +45,7 @@ flowchart TD
 
 | 节点 | 作用 |
 |------|------|
-| `regexGate` | 同步正则黑名单，命中即降级 |
-| `judgeGate` | 前置 LLM 裁判，判攻击即降级；裁判失败时 fail-open |
+| `judgeGate` | 前置 LLM 裁判；只有明确输出 `safe` 才放行，裁判失败或非预期输出都降级 |
 | `loadContext` | 拉本轮 prompt 需要的 stats / memory / history 上下文 |
 | `lowStateGate` | 根据低好感度 / 低心情做概率性不回复，最高 50%；命中时直接不发消息，不走兜底话术 |
 | `buildMessages` | 组装 system + history + 当前 user 消息 |
@@ -67,7 +64,7 @@ internal/
 ├── adapter/        IM 抽象 + OneBot v11 反向 WS 实现
 ├── agent/          eino Graph 装配
 │   ├── flow/       Input / State / VerdictKind
-│   ├── guard/      regex / judge / judgeGate
+│   ├── guard/      judge / judgeGate
 │   └── nodes/      其余 9 个节点
 ├── bot/            Adapter→Agent 主循环、并发控制
 ├── config/         YAML + 环境变量

@@ -161,13 +161,10 @@ type Agent struct {
 	EmptyReplyFallback string `yaml:"empty_reply_fallback"`
 }
 
-// Guard 描述提示词注入防护相关参数。
+// Guard 描述固定启用的 LLM 裁判与降级回复参数。
 type Guard struct {
-	// RegexPatterns 是第一级同步黑名单；任一命中即立即降级。
-	RegexPatterns []string `yaml:"regex_patterns"`
-	// JudgeEnabled 控制是否启用前置 LLM 裁判。关闭后仅保留正则 + prompt 包装两道防线。
-	JudgeEnabled bool `yaml:"judge_enabled"`
 	// JudgePromptFile 是 LLM 裁判 system prompt 的 YAML 文件路径。
+	// 裁判固定作为输入侧安全判定：只有明确输出 safe 才进入主链。
 	JudgePromptFile string `yaml:"judge_prompt_file"`
 	// FallbackReplies 是降级回复的候选池，运行时随机挑选一条。
 	FallbackReplies []string `yaml:"fallback_replies"`
@@ -280,12 +277,12 @@ func (c *Config) validate() error {
 	if c.LLM.BaseURL == "" || c.LLM.Model == "" {
 		return fmt.Errorf("config: llm.base_url and llm.model are required")
 	}
-	if (c.Guard.JudgeEnabled || c.Stats.Enabled || c.Memory.Enabled) && (c.Judge.BaseURL == "" || c.Judge.Model == "") {
-		return fmt.Errorf("config: judge.base_url and judge.model are required when guard/stats/memory uses judge model")
+	if c.Judge.BaseURL == "" || c.Judge.Model == "" {
+		return fmt.Errorf("config: judge.base_url and judge.model are required")
 	}
 	c.Guard.JudgePromptFile = strings.TrimSpace(c.Guard.JudgePromptFile)
-	if c.Guard.JudgeEnabled && c.Guard.JudgePromptFile == "" {
-		return fmt.Errorf("config: guard.judge_prompt_file is required when guard.judge_enabled")
+	if c.Guard.JudgePromptFile == "" {
+		return fmt.Errorf("config: guard.judge_prompt_file is required")
 	}
 	c.Stats.ScorePromptFile = strings.TrimSpace(c.Stats.ScorePromptFile)
 	if c.Stats.Enabled && c.Stats.ScorePromptFile == "" {
