@@ -19,6 +19,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cloudwego/eino/schema"
 	"github.com/echo/llm-bot/internal/domain"
 )
 
@@ -50,16 +51,26 @@ type Sender interface {
 	Send(ctx context.Context, out *domain.OutboundMessage) error
 }
 
+// HistoryWriter 是调度器写入历史所需的最小接口。
+//
+// store.HistoryRepo 天然满足这个接口；这里收窄依赖面，避免 Scheduler 需要关心
+// 历史读取能力。
+type HistoryWriter interface {
+	Append(ctx context.Context, sessionID string, msg *schema.Message, maxLen int) error
+}
+
 // Options 汇总 Scheduler 的依赖与配置。
 //
 // State/Generator/Sender 都是必需依赖；NewScheduler 不立即校验，RunOnce
 // 会在真正执行时返回明确错误，方便测试按需替换其中一部分。
 type Options struct {
-	State     *State
-	Generator *Generator
-	Sender    Sender
-	Logger    *slog.Logger
-	Config    Config
+	State      *State
+	Generator  *Generator
+	Sender     Sender
+	History    HistoryWriter
+	HistoryMax int
+	Logger     *slog.Logger
+	Config     Config
 }
 
 // Scheduler 运行单进程的主动消息调度循环。
@@ -67,13 +78,15 @@ type Options struct {
 // 这里不做分布式锁或主节点选举；多实例同时 Run 时可能在同一群上重复发送。
 // 当前约束是由进程装配层只启动一个 Scheduler。
 type Scheduler struct {
-	state     *State
-	generator *Generator
-	sender    Sender
-	log       *slog.Logger
-	cfg       Config
-	now       func() time.Time
-	rng       *rand.Rand
+	state      *State
+	generator  *Generator
+	sender     Sender
+	history    HistoryWriter
+	historyMax int
+	log        *slog.Logger
+	cfg        Config
+	now        func() time.Time
+	rng        *rand.Rand
 }
 
 // NewScheduler 构造调度器；这里不做分布式锁，调用方需保证只启动一个实例。
@@ -83,13 +96,15 @@ func NewScheduler(opts Options) *Scheduler {
 		cfg.Interval = 10 * time.Minute
 	}
 	return &Scheduler{
-		state:     opts.State,
-		generator: opts.Generator,
-		sender:    opts.Sender,
-		log:       cmp.Or(opts.Logger, slog.Default()),
-		cfg:       cfg,
-		now:       time.Now,
-		rng:       rand.New(rand.NewSource(time.Now().UnixNano())),
+		state:      opts.State,
+		generator:  opts.Generator,
+		sender:     opts.Sender,
+		history:    opts.History,
+		historyMax: opts.HistoryMax,
+		log:        cmp.Or(opts.Logger, slog.Default()),
+		cfg:        cfg,
+		now:        time.Now,
+		rng:        rand.New(rand.NewSource(time.Now().UnixNano())),
 	}
 }
 
@@ -119,8 +134,8 @@ func (s *Scheduler) Run(ctx context.Context) {
 
 // RunOnce 执行一轮调度；生产路径通常由 Run 调用，测试和管理命令可直接使用。
 //
-// 流程：开关 → 时间窗 → 扫 hash → 选最旧 → 生成 → 发 → 回写 last_inbound。
-// 任意短路点都会直接 return nil；只有 Redis 读写或发送的真实错误才上抛。
+// 流程：开关 → 时间窗 → 扫 hash → 选最旧 → 生成 → 发 → 写历史 → 回写 last_inbound。
+// 任意短路点都会直接 return nil；历史写入失败只记录 warn，不阻断防自激发回写。
 // 本轮至多发一个群，下轮再处理其他群——避免一次循环里把所有沉寂群轮一遍。
 func (s *Scheduler) RunOnce(ctx context.Context) error {
 	if s == nil {
@@ -174,6 +189,14 @@ func (s *Scheduler) RunOnce(ctx context.Context) error {
 		Text:      text,
 	}); err != nil {
 		return fmt.Errorf("proactive: send: %w", err)
+	}
+
+	if s.history != nil {
+		if err := s.history.Append(ctx, sessionID, schema.AssistantMessage(text, nil), s.historyMax); err != nil {
+			s.log.Warn("append proactive assistant history failed",
+				"session", sessionID,
+				"err", err)
+		}
 	}
 
 	// 防自激发：发完即视作"群里和 bot 又互动了一次"，等同一条群消息进来。

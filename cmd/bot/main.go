@@ -200,8 +200,8 @@ func buildMemory(cfg *config.Config, redisCli *redis.Client, logger *slog.Logger
 // ActivityRecorder 与 Scheduler 始终构造（永不返回 nil），运行期是否真正
 // 发送由 Redis 上的 `bot_proactive_enabled` 控制，未设值默认关闭。Sender
 // 作为参数传入，是因为只有 Adapter 自己知道怎么把消息发回平台，proactive
-// 内部不绑定 onebot 实现。historyRepo 仍传给 Generator——开场白会读最近
-// 几条群历史作为语气参考。
+// 内部不绑定 onebot 实现。historyRepo 传给 Generator 用来读取语气参考，也传给
+// Scheduler 用来在主动消息发送成功后写回群历史。
 func buildProactive(ctx context.Context, cfg *config.Config, redisCli *redis.Client, historyRepo store.HistoryRepo, sender proactive.Sender, logger *slog.Logger) (*proactive.ActivityRecorder, *proactive.Scheduler, error) {
 	state := proactive.NewState(redisCli, logger)
 	recorder := proactive.NewActivityRecorder(state, logger)
@@ -233,11 +233,13 @@ func buildProactive(ctx context.Context, cfg *config.Config, redisCli *redis.Cli
 		Prompts: prompts,
 	})
 	scheduler := proactive.NewScheduler(proactive.Options{
-		State:     state,
-		Generator: generator,
-		Sender:    sender,
-		Logger:    logger,
-		Config:    proactiveCfg,
+		State:      state,
+		Generator:  generator,
+		Sender:     sender,
+		History:    historyRepo,
+		HistoryMax: cfg.Agent.HistorySize,
+		Logger:     logger,
+		Config:     proactiveCfg,
 	})
 	logger.Info("proactive scheduler started")
 	return recorder, scheduler, nil

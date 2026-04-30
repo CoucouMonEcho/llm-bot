@@ -3,9 +3,9 @@
 // Build 负责：
 //  1. 构造主模型 / 裁判模型；
 //  2. 编译正则黑名单、构造 Judge；
-//  3. 把 regexGate / prepareStats / loadMemory / loadHistory / buildMessages /
-//     guardedModel / postproc / saveHistory / updateMemory / fallback / scoreStats
-//     十一个节点装配成 compose.Graph
+//  3. 把 regexGate / judgeGate / loadContext / buildMessages / chatModel /
+//     postproc / saveHistory / updateMemory / fallback / scoreStats 十个节点
+//     装配成 compose.Graph
 //     并编译为 Runnable；
 //  4. 返回 Runnable 给 Bot 主循环。
 //
@@ -17,21 +17,22 @@
 //	regexGate ── (命中) ──► fallback ────────────────┐
 //	  │ (未命中)
 //	  ▼
-//	prepareStats ──► loadMemory ──► loadHistory ──► buildMessages ──► guardedModel
+//	judgeGate ── (攻击) ──► fallback ────────────────┐
+//	  │ (放行)                                       │
+//	  ▼                                              │
+//	loadContext ──► buildMessages ──► chatModel ──► postproc
 //	                                                   │
-//	                                      攻击 ────────┴──────── 放行
-//	                                      │                        │
-//	                                      ▼                        ▼
-//	                                  fallback                  postproc
-//	                                      │                        │
-//	                                      └──────────┐             ▼
-//	                                                 │        saveHistory
-//	                                                 │             │
-//	                                                 ▼             ▼
-//	                                             scoreStats ◄── updateMemory ◄──┘
-//	                                                 │
-//	                                                 ▼
-//	                                                END
+//	                                                   ▼
+//	                                              saveHistory
+//	                                                   │
+//	                                                   ▼
+//	                                              updateMemory
+//	                                                   │
+//	                                                   ▼
+//	                                             scoreStats
+//	                                                   │
+//	                                                   ▼
+//	                                                  END
 package agent
 
 import (
@@ -80,11 +81,10 @@ type Runnable = compose.Runnable[*flow.Input, *flow.State]
 // 节点 key 常量化，避免字符串散落。
 const (
 	nodeRegexGate     = "regexGate"
-	nodePrepareStats  = "prepareStats"
-	nodeLoadMemory    = "loadMemory"
-	nodeLoadHistory   = "loadHistory"
+	nodeJudgeGate     = "judgeGate"
+	nodeLoadContext   = "loadContext"
 	nodeBuildMessages = "buildMessages"
-	nodeGuardedModel  = "guardedModel"
+	nodeChatModel     = "chatModel"
 	nodePostproc      = "postproc"
 	nodeFallback      = "fallback"
 	nodeSaveHistory   = "saveHistory"
@@ -121,11 +121,10 @@ func Build(ctx context.Context, cfg *config.Config, deps Deps) (Runnable, error)
 	// buildMessages 节点用函数字面量注入 Persona.BuildMessages，避免 nodes
 	// 反向依赖 agent 包（会形成 import 环）。
 	regexGateNode := guard.NewRegexGate(regex, deps.Logger)
-	prepareStatsNode := nodes.NewPrepareStats(deps.Stats)
-	loadMemoryNode := nodes.NewLoadMemory(deps.Memory, cfg.Memory.MaxChars, deps.Logger)
-	loadHistoryNode := nodes.NewLoadHistory(deps.History, cfg.Agent.HistorySize, deps.Logger)
+	judgeGateNode := guard.NewJudgeGate(judge, deps.Logger)
+	loadContextNode := nodes.NewLoadContext(deps.Stats, deps.Memory, deps.History, cfg.Memory.MaxChars, cfg.Agent.HistorySize, deps.Logger)
 	buildMessagesNode := nodes.NewBuildMessages(deps.Persona.BuildMessages)
-	guardedModelNode := guard.NewGuardedModel(mainModel, judge, deps.Logger)
+	chatModelNode := nodes.NewChatModel(mainModel)
 	postprocNode := nodes.NewPostproc(cfg.Agent.EmptyReplyFallback)
 	fallbackNode := nodes.NewFallback(cfg.Guard.FallbackReplies)
 	saveHistoryNode := nodes.NewSaveHistory(deps.History, cfg.Agent.HistorySize, deps.Logger)
@@ -140,11 +139,10 @@ func Build(ctx context.Context, cfg *config.Config, deps Deps) (Runnable, error)
 		lambda *compose.Lambda
 	}{
 		{nodeRegexGate, regexGateNode},
-		{nodePrepareStats, prepareStatsNode},
-		{nodeLoadMemory, loadMemoryNode},
-		{nodeLoadHistory, loadHistoryNode},
+		{nodeJudgeGate, judgeGateNode},
+		{nodeLoadContext, loadContextNode},
 		{nodeBuildMessages, buildMessagesNode},
-		{nodeGuardedModel, guardedModelNode},
+		{nodeChatModel, chatModelNode},
 		{nodePostproc, postprocNode},
 		{nodeFallback, fallbackNode},
 		{nodeSaveHistory, saveHistoryNode},
@@ -161,10 +159,9 @@ func Build(ctx context.Context, cfg *config.Config, deps Deps) (Runnable, error)
 	// 攻击消息不入历史但仍触发回复后打分"是 graph 的显式结构而非副作用。
 	edges := []struct{ from, to string }{
 		{compose.START, nodeRegexGate},
-		{nodePrepareStats, nodeLoadMemory},
-		{nodeLoadMemory, nodeLoadHistory},
-		{nodeLoadHistory, nodeBuildMessages},
-		{nodeBuildMessages, nodeGuardedModel},
+		{nodeLoadContext, nodeBuildMessages},
+		{nodeBuildMessages, nodeChatModel},
+		{nodeChatModel, nodePostproc},
 		{nodePostproc, nodeSaveHistory},
 		{nodeSaveHistory, nodeUpdateMemory},
 		{nodeUpdateMemory, nodeScoreStats},
@@ -177,38 +174,38 @@ func Build(ctx context.Context, cfg *config.Config, deps Deps) (Runnable, error)
 		}
 	}
 
-	// regexGate 根据同步正则结果路由：放行进入 prepareStats，命中进入 fallback。
+	// regexGate 根据同步正则结果路由：放行进入 judgeGate，命中进入 fallback。
 	regexBranch := compose.NewGraphBranch(
 		func(_ context.Context, st *flow.State) (string, error) {
 			if st.VerdictKind != flow.VerdictSafe {
 				return nodeFallback, nil
 			}
-			return nodePrepareStats, nil
+			return nodeJudgeGate, nil
 		},
 		map[string]bool{
-			nodePrepareStats: true,
-			nodeFallback:     true,
+			nodeJudgeGate: true,
+			nodeFallback:  true,
 		},
 	)
 	if err := g.AddBranch(nodeRegexGate, regexBranch); err != nil {
 		return nil, fmt.Errorf("agent: add regexGate branch: %w", err)
 	}
 
-	// guardedModel 根据裁判结果路由：放行进入 postproc，攻击进入 fallback。
+	// judgeGate 根据裁判结果路由：放行进入 loadContext，攻击进入 fallback。
 	verdictBranch := compose.NewGraphBranch(
 		func(_ context.Context, st *flow.State) (string, error) {
 			if st.VerdictKind != flow.VerdictSafe {
 				return nodeFallback, nil
 			}
-			return nodePostproc, nil
+			return nodeLoadContext, nil
 		},
 		map[string]bool{
-			nodePostproc: true,
-			nodeFallback: true,
+			nodeLoadContext: true,
+			nodeFallback:    true,
 		},
 	)
-	if err := g.AddBranch(nodeGuardedModel, verdictBranch); err != nil {
-		return nil, fmt.Errorf("agent: add guardedModel branch: %w", err)
+	if err := g.AddBranch(nodeJudgeGate, verdictBranch); err != nil {
+		return nil, fmt.Errorf("agent: add judgeGate branch: %w", err)
 	}
 
 	// 步骤 5：编译 Graph。
@@ -218,6 +215,8 @@ func Build(ctx context.Context, cfg *config.Config, deps Deps) (Runnable, error)
 	}
 
 	deps.Logger.Info("agent graph compiled",
+		slog.String("main_path", "regexGate->judgeGate->loadContext->buildMessages->chatModel->postproc->saveHistory->updateMemory->scoreStats"),
+		slog.String("blocked_path", "fallback->scoreStats"),
 		slog.Bool("judge_enabled", cfg.Guard.JudgeEnabled),
 		slog.Int("regex_count", len(cfg.Guard.RegexPatterns)),
 		slog.Int("history_size", cfg.Agent.HistorySize),

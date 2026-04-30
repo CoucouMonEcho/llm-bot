@@ -1,7 +1,7 @@
 // Package nodes 实现 Agent Graph 中的非 guard Lambda 节点。
 //
 // 本文件：postproc 节点。
-// 位置：guard(未拦截) → postproc → saveHistory → scoreStats。
+// 位置：chatModel → postproc → saveHistory → updateMemory → scoreStats。
 // 职责：对主链产出的 Reply 做"发送前清洗"——裁剪空白、限制长度、
 // 剥除潜在的"泄露 system prompt"式片段。
 //
@@ -9,7 +9,7 @@
 //   - 只做"肉眼可验证"的纯文本处理：正则折叠空行 + 按 rune 截断长度；
 //     规则本地即可审查，零 IO、零 LLM 调用，处理耗时几乎不可测；
 //   - 输出侧不做"LLM 二次判断回复是否违规"——业务明确要求不增加响应延迟，
-//     注入/越狱的判定放在 guardedModel 节点由 judge 在输入侧并行承担。
+//     注入/越狱的判定放在 judgeGate 节点由独立 judge 在输入侧前置完成。
 package nodes
 
 import (

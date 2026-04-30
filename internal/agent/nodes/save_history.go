@@ -1,6 +1,6 @@
 // Package nodes 的 save_history.go 实现"把本轮对话写回 Redis"的 Lambda 节点。
 //
-// 位置：postproc → saveHistory → scoreStats → END。
+// 位置：postproc → saveHistory → updateMemory → scoreStats → END。
 // 只有 "正常回复" 路径会走到这里——被 guard 判定为攻击的消息及其降级回复
 // 都通过 branch 直接跳到 fallback → scoreStats → END，从而天然地**不入历史**。
 //

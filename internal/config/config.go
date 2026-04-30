@@ -164,7 +164,7 @@ type Agent struct {
 type Guard struct {
 	// RegexPatterns 是第一级同步黑名单；任一命中即立即降级。
 	RegexPatterns []string `yaml:"regex_patterns"`
-	// JudgeEnabled 控制是否启用并行 LLM 裁判。关闭后仅保留正则 + prompt 包装两道防线。
+	// JudgeEnabled 控制是否启用前置 LLM 裁判。关闭后仅保留正则 + prompt 包装两道防线。
 	JudgeEnabled bool `yaml:"judge_enabled"`
 	// JudgePromptFile 是 LLM 裁判 system prompt 的 YAML 文件路径。
 	JudgePromptFile string `yaml:"judge_prompt_file"`

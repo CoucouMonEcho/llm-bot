@@ -81,12 +81,12 @@ type State struct {
 	// In 是入参的只读快照，整个 Graph 生命周期内不应被修改。
 	In *Input
 
-	// History 是 loadHistory 节点从 Redis 拉回的历史消息（旧→新）。
+	// History 是 loadContext 节点从 Redis 拉回的历史消息（旧→新）。
 	// 读取失败时为 nil 切片；下游应当视 nil 与空切片等价。
 	History []*schema.Message
 
 	// Messages 是 buildMessages 节点组装好的"system + history + current"消息列表，
-	// 直接交给 guardedModel 节点作为 Generate 的入参。
+	// 直接交给 chatModel 节点作为 Generate 的入参。
 	Messages []*schema.Message
 
 	// Reply 是 LLM 的最终回复（可能为降级回复）。
@@ -98,7 +98,7 @@ type State struct {
 	VerdictKind VerdictKind
 
 	// Affinity / Mood 是本轮对话开始时 stats 快照的平铺字段。
-	// 由 prepareStats 节点在装配系统提示词之前填入；若 stats 功能关闭、读取
+	// 由 loadContext 节点在装配系统提示词之前填入；若 stats 功能关闭、读取
 	// 失败或 UserID 缺失，两者均保持零值——下游按"无信号"处理（具体语义仍
 	// 在 stats 包定义，零值即 stats.Snapshot.IsZero() 的状态）。
 	//

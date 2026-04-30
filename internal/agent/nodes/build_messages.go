@@ -1,13 +1,13 @@
 // Package nodes 的 build_messages.go 实现"把长期记忆 + 历史 + 用户 Query 组装成
 // LLM 消息列表"的 Lambda 节点。
 //
-// 位置：loadHistory → buildMessages → guardedModel。
+// 位置：loadContext → buildMessages → chatModel。
 //
 // 为什么独立成节点：
 //   - 消息组装形态（是否加系统提示词、如何设置消息 name、系统提示词的具体
 //     内容）属于"人设/模板"关切，与 guard / 主链调用完全正交；
 //   - 把它独立出来，未来引入 RAG 检索、Few-shot 示例、工具调用指令时，只需在
-//     本节点之后插入新节点修改 Messages，而不必改 guardedModel；
+//     本节点之后插入新节点修改 Messages，而不必改 chatModel；
 //   - 本节点不 import agent 包：为了避免循环依赖（agent.Build → nodes，若 nodes
 //     又反向依赖 agent.Persona 就是环），构造器接收一个 build 函数字面量，
 //     由 agent.Build 用 persona.BuildMessages 做闭包注入。这让 nodes 仅依赖 flow。

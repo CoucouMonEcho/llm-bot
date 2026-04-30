@@ -68,9 +68,8 @@ func NewJudge(m model.BaseChatModel, systemPrompt string) *Judge {
 
 // Classify 对 input 做一次攻击分类。
 //
-// 注意传入的 ctx：在 guardedModel 节点里，这个 ctx 是 errgroup 派生出来的
-// 子 ctx。当主链因检测出攻击被 cancel 时，裁判若已经在请求中也会一起取消
-// （虽然这个场景罕见——裁判通常比主链先结束）。
+// 注意传入的 ctx：在 judgeGate 节点里，这个 ctx 由 Graph 调用链传入；
+// 上游取消时裁判请求也会一起取消。裁判只负责输入侧判定，不与主聊天模型并发。
 //
 // 返回值语义：
 //   - attack==true 表示被判定为注入攻击，调用方应走降级分支；

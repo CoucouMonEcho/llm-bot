@@ -3,7 +3,7 @@
 // 位置：START → regexGate → (branch by VerdictKind)
 //   - 命中任一黑名单 → st.VerdictKind = VerdictRegex，命中的 pattern 在本节点
 //     当场打日志；随后 branch 路由到 fallback；
-//   - 未命中 → VerdictKind 保持零值（Safe），继续流向 prepareStats。
+//   - 未命中 → VerdictKind 保持零值（Safe），继续流向 judgeGate。
 //
 // 为什么独立成节点：
 //   - 正则检测是 Graph 的唯一"纯同步、无 IO、无 LLM"环节，独立出来可以让
