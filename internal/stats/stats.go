@@ -3,9 +3,9 @@
 // 当前包含两个参数：
 //   - Affinity（好感度）：按"平台 + 用户"分 member，存在全局 ZSET
 //     "bot_stats_affinity_rank" 里，member 形如 "<platform>_<userID>"。
-//     语义是"某个用户在机器人心里的累计好感度"。选择 ZSET 而不是 Hash，
-//     是因为它既能按 member 点查，又能按 score 排序给主动消息挑候选；
-//     这份 ZSET 是好感度的唯一真相源，旧 Hash 结构不再参与读取。
+//     语义是"某个用户在机器人心里的累计好感度"，按人头维护，仅供 passive
+//     主链使用（按 member 点查当前用户分值）。选 ZSET 而不是 Hash，是为了
+//     未来扩展按 score 范围扫描时不必再迁库；当前 proactive 链路不再读取它。
 //   - Mood（心情）：全局 Hash "bot_stats_global"，field "mood"，
 //     语义是"机器人当前整体心情"，所有用户共享——人不会因为换一个聊天对象
 //     就切换心情。放在 hash 里而不是独立 string key，是为了给后续扩展的
@@ -126,7 +126,8 @@ const (
 
 	// keyAffinity 存"按人头"的好感度排行——所有用户的好感度都在同一个 ZSET 里，
 	// member 通过 affinityField(platform, userID) 生成，score 就是当前好感度。
-	// 让主动消息从同一份 ZSET 取 topN，可以避免另建候选索引带来的同步问题。
+	// 这份 ZSET 仅供 passive 主链消费（按 member 点查当前用户分值）；
+	// 选用 ZSET 而不是 Hash 是为了未来扩展按 score 范围扫描时不必再迁库。
 	keyAffinity = "bot_stats_affinity_rank"
 )
 
@@ -220,13 +221,6 @@ func moodPromptLabel(v int) string {
 	}
 }
 
-// RankEntry 是 stats 好感度排行中的一行；按"平台 + 用户"维度。
-type RankEntry struct {
-	Platform string
-	UserID   string
-	Score    float64
-}
-
 // Delta 描述一次打分后要对 stats 施加的增量。
 //
 // 和 Snapshot 刻意分成两个类型：一个是"状态"一个是"变化量"，语义不同；
@@ -301,35 +295,6 @@ func (s *Store) Snapshot(ctx context.Context, platform, userID string, now time.
 	}
 
 	return Snapshot{Affinity: aff, Mood: mood}
-}
-
-// TopUsers 返回好感度最高的最多 n 个 (platform, userID, score)。
-//
-// 解析失败的 member 会被跳过并 warn——保留主动消息策略对 stats key 的"近似一致"假设。
-// n <= 0 或 Store 未连接 Redis 时返回 nil, nil。
-func (s *Store) TopUsers(ctx context.Context, n int) ([]RankEntry, error) {
-	if s == nil || s.rdb == nil || n <= 0 {
-		return nil, nil
-	}
-	rows, err := s.rdb.ZRevRangeWithScores(ctx, keyAffinity, 0, int64(n-1)).Result()
-	if err != nil {
-		return nil, fmt.Errorf("stats: read affinity rank: %w", err)
-	}
-	out := make([]RankEntry, 0, len(rows))
-	for _, row := range rows {
-		member := fmt.Sprint(row.Member)
-		platform, userID, ok := strings.Cut(member, "_")
-		if !ok || platform == "" || userID == "" {
-			s.log.Warn("stats affinity member skipped", "member", member)
-			continue
-		}
-		out = append(out, RankEntry{
-			Platform: platform,
-			UserID:   userID,
-			Score:    row.Score,
-		})
-	}
-	return out, nil
 }
 
 // parseMoodState 解析 HMGET mood/last_chat_at 的结果；缺失 mood 按 moodInitial 处理。

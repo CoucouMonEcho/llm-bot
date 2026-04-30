@@ -1,7 +1,7 @@
-// Package proactive 的 generator.go 实现主动开场白生成。
+// Package proactive 的 generator.go 实现群主动开场白生成。
 //
-// 生成器只读同一会话历史作为语气参考，不写历史、不改状态；调度器负责发送后的
-// 冷却、日限额和 PendingContext 写入。
+// 生成器只读同一群的对话历史作为语气参考，不写历史、不改状态；调度器负责
+// 发送和发送后的状态回写。当前主动消息只面向群聊，不存在私聊语境。
 package proactive
 
 import (
@@ -14,13 +14,12 @@ import (
 
 	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/schema"
-	"github.com/echo/llm-bot/internal/domain"
 	"github.com/echo/llm-bot/internal/store"
 )
 
 // GeneratorOptions 汇总 Generator 的模型、历史仓库和配置。
 //
-// History 可以为 nil，此时生成器只根据候选元信息写开场白。Config 复用扁平的
+// History 可以为 nil，此时生成器只根据时间信息写开场白。Config 复用扁平的
 // proactive.Config，Generator 自己只读其中两个字段。
 type GeneratorOptions struct {
 	Model   model.BaseChatModel
@@ -32,9 +31,9 @@ type GeneratorOptions struct {
 
 // Generator 负责生成短主动消息。
 //
-// 它只读取同一会话历史作为语气参考，不写入长期历史；真正发送和状态写入由
-// Scheduler 完成。历史只用于模仿当前会话语气，不允许模型引用或总结；因此默
-// 认读取很少几条。historySize 为负数时显式跳过历史读取。
+// 它只读取同一群的历史作为语气参考，不写入长期历史；真正发送和状态写入由
+// Scheduler 完成。历史只用于模仿当前会话语气，不允许模型引用或总结；因此
+// 默认读取很少几条。historySize 为负数时显式跳过历史读取。
 type Generator struct {
 	model           model.BaseChatModel
 	history         store.HistoryRepo
@@ -59,25 +58,27 @@ func NewGenerator(opts GeneratorOptions) *Generator {
 	}
 }
 
-// Generate 为候选目标生成一条可直接发送的主动消息。
+// Generate 为某个群生成一条可直接发送的主动开场白。
 //
-// 生成结果会经过 cleanGeneratedText 清理和敏感片段检查；不合格时返回错误，
-// 调度器会放弃本轮发送。
-func (g *Generator) Generate(ctx context.Context, cand Candidate, now time.Time) (string, error) {
+// 入参只保留三件事：群 sessionID、群里上一次互动时间、当前时间。生成结果
+// 经过 cleanGeneratedText 清理和敏感片段检查；不合格时返回错误，调度器会
+// 放弃本轮发送。历史已在 store.Load 出口处自带 [YYYY-MM-DD HH:MM] 前缀，
+// formatHistory 不再额外渲染时间。
+func (g *Generator) Generate(ctx context.Context, sessionID string, lastInboundAt, now time.Time) (string, error) {
 	if g == nil || g.model == nil {
 		return "", fmt.Errorf("proactive: nil generator model")
 	}
-	if cand.Platform == "" || cand.ConvType == "" || cand.SessionID == "" {
-		return "", fmt.Errorf("proactive: incomplete candidate")
+	if sessionID == "" {
+		return "", fmt.Errorf("proactive: empty session id")
 	}
 
-	history, err := g.loadHistory(ctx, cand.SessionID)
+	history, err := g.loadHistory(ctx, sessionID)
 	if err != nil {
 		return "", err
 	}
 	messages := []*schema.Message{
 		schema.SystemMessage(g.prompts.System),
-		schema.UserMessage(buildGeneratorPrompt(g.prompts, cand, now, history, g.maxHistoryChars)),
+		schema.UserMessage(buildGeneratorPrompt(g.prompts, now, lastInboundAt, history, g.maxHistoryChars)),
 	}
 	reply, err := g.model.Generate(ctx, messages)
 	if err != nil {
@@ -102,22 +103,17 @@ func (g *Generator) loadHistory(ctx context.Context, sessionID string) ([]*schem
 	return msgs, nil
 }
 
-// buildGeneratorPrompt 组装用户消息，把候选来源转成模型能理解的上下文。
+// buildGeneratorPrompt 组装用户消息。当前只剩群聊一种语境，不再有
+// 会话类型 / 私聊昵称 / 近期群活动等分支字段。
 //
-// 这里不写入 Source/Affinity 等内部字段，只给时间、会话类型和同会话历史。
-func buildGeneratorPrompt(prompts GeneratorPrompts, cand Candidate, now time.Time, history []*schema.Message, maxHistoryChars int) string {
+// 历史已在 Load 出口处自带 `[YYYY-MM-DD HH:MM] ` 前缀，模型自然能看到
+// 时间分布，不必再额外注入。
+func buildGeneratorPrompt(prompts GeneratorPrompts, now, lastInboundAt time.Time, history []*schema.Message, maxHistoryChars int) string {
 	var b strings.Builder
 	up := prompts.UserPrompt
 	fmt.Fprintf(&b, "%s%s\n", up.CurrentTimeLabel, now.Format(time.RFC3339))
-	fmt.Fprintf(&b, "%s%s\n", up.ConversationTypeLabel, humanConversationType(up.ConversationTypes, cand.ConvType))
-	if cand.ConvType == domain.ConversationPrivate && cand.UserName != "" {
-		fmt.Fprintf(&b, "%s%s\n", up.PrivateDisplayNameLabel, cand.UserName)
-	}
-	if !cand.LastInboundAt.IsZero() {
-		fmt.Fprintf(&b, "%s%s\n", up.LastInboundAtLabel, cand.LastInboundAt.Format(time.RFC3339))
-	}
-	if !cand.EventAt.IsZero() {
-		fmt.Fprintf(&b, "%s%s\n", up.RecentGroupActivityLabel, cand.EventAt.Format(time.RFC3339))
+	if !lastInboundAt.IsZero() {
+		fmt.Fprintf(&b, "%s%s\n", up.LastInboundAtLabel, lastInboundAt.Format(time.RFC3339))
 	}
 	b.WriteByte('\n')
 	b.WriteString(up.HistoryHeader)
@@ -177,18 +173,11 @@ func truncateString(s string, maxBytes int) string {
 	return s
 }
 
-// humanConversationType 把会话类型翻成配置文案，减少模型理解内部枚举的成本。
-func humanConversationType(labels map[string]string, convType domain.ConversationType) string {
-	if label := labels[string(convType)]; label != "" {
-		return label
-	}
-	return string(convType)
-}
-
 // cleanGeneratedText 清理模型输出并拦截不应发送的片段。
 //
 // 它只做轻量规则：去掉外层引号、压平空白、检查禁用词；复杂安全判断仍由上游
-// guard 和模型提示词负责。
+// guard 和模型提示词负责。forbidden_fragments 这层防御独立于业务路径——即便
+// 业务上不再涉及好感/候选/调度等概念，模型也不该说出这些内部词。
 func cleanGeneratedText(raw string, forbidden []string) (string, error) {
 	text := strings.TrimSpace(raw)
 	if fragment, ok := containsForbiddenFragment(text, forbidden); ok {

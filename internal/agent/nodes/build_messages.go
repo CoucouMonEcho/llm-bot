@@ -27,8 +27,8 @@ import (
 // 典型实现是 agent.Persona.BuildMessages；测试时可以用一个替身函数替换。
 //
 // affinity / mood 同时为 0 表示"无信号"（stats 关闭、读 Redis 失败或 UserID
-// 缺失）——BuildFunc 约定此时不追加状态行，因此调用方传 0,0 即可，不需要
-// 另外的开关参数。
+// 缺失）——此时 PromptLine 只渲染当前时间行而不暴露关系/心情标签；调用方
+// 传 0,0 即可，不需要额外的开关参数。
 type BuildFunc func(history []*schema.Message, query, userID string, affinity, mood int, memory string) ([]*schema.Message, error)
 
 // NewBuildMessages 构造 buildMessages 节点。

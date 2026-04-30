@@ -1,7 +1,12 @@
 // Package proactive 的 scheduler.go 实现主动消息调度循环。
 //
-// 调度器按固定间隔加随机抖动运行：先检查配置开关和 Redis 运行期开关，再判断时间窗、
-// 日限额、候选、生成和发送。发送成功后才写冷却、日计数。
+// 调度器按固定间隔加随机抖动运行：先检查 Redis 运行期开关与时间窗，再扫
+// 一遍"群最后互动时间" HASH，挑出最久未活跃且超过冷却阈值的群，生成开场
+// 白发出去，最后回写 last_inbound 防自激发。
+//
+// 决策面只剩"群冷却 + 时间窗 + Redis 开关"三件事——日限额、会话冷却、
+// 好感度排行、白名单等已被刻意删除：群冷却本身已经是足够的频率约束，
+// "1h 没人和我说话才主动开口"在直觉上也容易解释。
 package proactive
 
 import (
@@ -22,46 +27,35 @@ const sendTimeout = 15 * time.Second
 
 // Config 是主动消息调度器的静态配置。
 //
-// WindowStart/WindowEnd 使用本地时间的 HH:MM 字符串；Enabled 只代表配置侧开关，
-// 还必须同时打开 Redis 运行期开关才会真正发送。DryRun 只生成和记录日志，不写发送状态。
+// WindowStart/WindowEnd 使用本地时间的 HH:MM 字符串；运行期开关保存在 Redis
+// （`State.Enabled`），由 RunOnce 每轮检查，本结构体只保存调度参数。
 //
-// Selector / Generator 关心的字段直接平铺在这里——proactive 内部的几个组件
-// 都从同一份 Config 取自己关心的子集，避免再嵌套一层只为了"按职责分组"。
+// Generator 关心的字段也平铺在这里——proactive 内部组件都从同一份 Config
+// 取自己关心的子集，避免再嵌套一层只为了"按职责分组"。
 type Config struct {
-	Enabled     bool
-	WindowStart string
-	WindowEnd   string
-	Interval    time.Duration
-	Jitter      time.Duration
-	DailyLimit  int
-	DryRun      bool
+	WindowStart   string
+	WindowEnd     string
+	Interval      time.Duration
+	Jitter        time.Duration
+	IdleThreshold time.Duration
 
-	// 选择器相关
-	AffinityTopN    int
-	MinSinceLast    time.Duration
-	MaxSinceLast    time.Duration
-	RecentEventScan int
-	SessionCooldown time.Duration
-
-	// 生成器相关
 	HistorySize     int
 	MaxHistoryChars int
 }
 
 // Sender 是调度器依赖的最小发送接口。
 //
-// 调度器只关心“把一条 OutboundMessage 发出去”，具体平台适配由 bot 层实现。
+// 调度器只关心"把一条 OutboundMessage 发出去"，具体平台适配由 bot 层实现。
 type Sender interface {
 	Send(ctx context.Context, out *domain.OutboundMessage) error
 }
 
 // Options 汇总 Scheduler 的依赖与配置。
 //
-// State/Selector/Generator/Sender 都是必需依赖；NewScheduler 不立即校验，
-// RunOnce 会在真正执行时返回明确错误，方便测试按需替换其中一部分。
+// State/Generator/Sender 都是必需依赖；NewScheduler 不立即校验，RunOnce
+// 会在真正执行时返回明确错误，方便测试按需替换其中一部分。
 type Options struct {
 	State     *State
-	Selector  *Selector
 	Generator *Generator
 	Sender    Sender
 	Logger    *slog.Logger
@@ -70,11 +64,10 @@ type Options struct {
 
 // Scheduler 运行单进程的主动消息调度循环。
 //
-// 这里不做分布式锁或主节点选举；如果多实例同时 Run，日限额和冷却可能出现
-// 竞争窗口。当前约束是由进程装配层只启动一个 Scheduler。
+// 这里不做分布式锁或主节点选举；多实例同时 Run 时可能在同一群上重复发送。
+// 当前约束是由进程装配层只启动一个 Scheduler。
 type Scheduler struct {
 	state     *State
-	selector  *Selector
 	generator *Generator
 	sender    Sender
 	log       *slog.Logger
@@ -87,11 +80,10 @@ type Scheduler struct {
 func NewScheduler(opts Options) *Scheduler {
 	cfg := opts.Config
 	if cfg.Interval <= 0 {
-		cfg.Interval = time.Hour
+		cfg.Interval = 10 * time.Minute
 	}
 	return &Scheduler{
 		state:     opts.State,
-		selector:  opts.Selector,
 		generator: opts.Generator,
 		sender:    opts.Sender,
 		log:       cmp.Or(opts.Logger, slog.Default()),
@@ -103,8 +95,8 @@ func NewScheduler(opts Options) *Scheduler {
 
 // Run 持续执行调度，直到 ctx 取消。
 //
-// 单轮失败只记录日志，下一轮仍按 interval+jitter 继续尝试；主动消息是附加能力，
-// 不应该因为一次候选/生成/发送失败让后台循环退出。
+// 单轮失败只记录日志，下一轮仍按 interval+jitter 继续尝试；主动消息是附加
+// 能力，不应该因为一次扫描/生成/发送失败让后台循环退出。
 func (s *Scheduler) Run(ctx context.Context) {
 	if s == nil {
 		return
@@ -127,21 +119,18 @@ func (s *Scheduler) Run(ctx context.Context) {
 
 // RunOnce 执行一轮调度；生产路径通常由 Run 调用，测试和管理命令可直接使用。
 //
-// 静态开关、运行期开关、时间窗、日限额都会在生成前短路。只有真实发送成功后才写
-// 最近主动发送时间和日计数，保证这些状态与实际发出的消息一致。
+// 流程：开关 → 时间窗 → 扫 hash → 选最旧 → 生成 → 发 → 回写 last_inbound。
+// 任意短路点都会直接 return nil；只有 Redis 读写或发送的真实错误才上抛。
+// 本轮至多发一个群，下轮再处理其他群——避免一次循环里把所有沉寂群轮一遍。
 func (s *Scheduler) RunOnce(ctx context.Context) error {
 	if s == nil {
 		return fmt.Errorf("proactive: nil scheduler")
 	}
-	if s.state == nil || s.selector == nil || s.generator == nil || s.sender == nil {
+	if s.state == nil || s.generator == nil || s.sender == nil {
 		return fmt.Errorf("proactive: incomplete scheduler dependencies")
 	}
 
 	now := s.now()
-	if !s.cfg.Enabled {
-		s.log.Debug("proactive scheduler skipped", "reason", "static_disabled")
-		return nil
-	}
 
 	enabled, err := s.state.Enabled(ctx)
 	if err != nil {
@@ -161,65 +150,64 @@ func (s *Scheduler) RunOnce(ctx context.Context) error {
 		return nil
 	}
 
-	count, err := s.state.DailyCount(ctx, now)
+	groups, err := s.state.GroupsLastInbound(ctx)
 	if err != nil {
 		return err
 	}
-	if count >= s.cfg.DailyLimit {
-		s.log.Info("proactive scheduler skipped", "reason", "daily_limit", "count", count, "limit", s.cfg.DailyLimit)
+	sessionID, lastAt, ok := pickOldestIdle(groups, now, s.cfg.IdleThreshold)
+	if !ok {
+		s.log.Debug("proactive scheduler skipped", "reason", "no_idle_group")
 		return nil
 	}
 
-	cand, err := s.selector.Select(ctx, now)
+	text, err := s.generator.Generate(ctx, sessionID, lastAt, now)
 	if err != nil {
 		return err
-	}
-	if cand == nil {
-		s.log.Debug("proactive scheduler skipped", "reason", "no_candidate")
-		return nil
-	}
-
-	text, err := s.generator.Generate(ctx, *cand, now)
-	if err != nil {
-		return err
-	}
-	if s.cfg.DryRun {
-		// DryRun 只产生日志，不发送消息，也不写入冷却或日限额。
-		s.log.Info("proactive dry-run would send",
-			"platform", cand.Platform,
-			"convType", cand.ConvType,
-			"session", cand.SessionID,
-			"source", cand.Source,
-			"text", text)
-		return nil
 	}
 
 	sendCtx, cancel := context.WithTimeout(ctx, sendTimeout)
 	defer cancel()
 	if err := s.sender.Send(sendCtx, &domain.OutboundMessage{
-		Platform:  cand.Platform,
-		ConvType:  cand.ConvType,
-		SessionID: cand.SessionID,
+		Platform:  domain.PlatformOneBot,
+		ConvType:  domain.ConversationGroup,
+		SessionID: sessionID,
 		Text:      text,
-		ReplyTo:   nil,
 	}); err != nil {
-		return fmt.Errorf("proactive: send message: %w", err)
+		return fmt.Errorf("proactive: send: %w", err)
 	}
 
-	// 只有真实发送成功后才写状态：冷却时间和日限额必须保持一致。
-	if err := s.state.SetLastProactiveAt(ctx, cand.Platform, cand.SessionID, now); err != nil {
-		return err
-	}
-	if _, err := s.state.IncrementDailyCount(ctx, now); err != nil {
+	// 防自激发：发完即视作"群里和 bot 又互动了一次"，等同一条群消息进来。
+	if err := s.state.RecordGroupInbound(ctx, sessionID, now); err != nil {
 		return err
 	}
 
 	s.log.Info("proactive message sent",
-		"platform", cand.Platform,
-		"convType", cand.ConvType,
-		"session", cand.SessionID,
-		"source", cand.Source)
+		"session", sessionID,
+		"idle", now.Sub(lastAt))
 	return nil
+}
+
+// pickOldestIdle 从 last 中挑出 lastAt + idle <= now 的群里 lastAt 最小的那个。
+//
+// 全部未达 idle 时返回 ok=false；多群同 lastAt 时优先返回 sessionID 字典序
+// 最小的（确定性可重复）。这是个纯函数：不依赖 *Scheduler、不依赖 ctx，
+// 也不依赖任何随机源——便于表驱动单测覆盖边界（空 map / 全部未达 / 多群同
+// lastAt / 边界等于 idle / now 早于 lastAt 等）。
+func pickOldestIdle(last map[string]time.Time, now time.Time, idle time.Duration) (sessionID string, lastAt time.Time, ok bool) {
+	for sid, t := range last {
+		if now.Sub(t) < idle {
+			continue
+		}
+		switch {
+		case !ok:
+			sessionID, lastAt, ok = sid, t, true
+		case t.Before(lastAt):
+			sessionID, lastAt = sid, t
+		case t.Equal(lastAt) && sid < sessionID:
+			sessionID = sid
+		}
+	}
+	return sessionID, lastAt, ok
 }
 
 // inTimeWindow 判断 now 是否落在本地 HH:MM 时间窗内，支持跨零点窗口。

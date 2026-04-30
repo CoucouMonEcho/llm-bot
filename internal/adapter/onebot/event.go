@@ -66,7 +66,7 @@ type messageSegment struct {
 //  3. 按 blacklist.user_ids 过滤用户；
 //  4. 根据配置的 trigger 规则判断"该不该理"——
 //     4.1 私聊：按 trigger.Private 决定；
-//     4.2 群聊：先剥离 @bot 段，随后按 trigger.GroupAtOnly 与 prefix 决定；
+//     4.2 群聊：先剥离 @bot 段，随后按 prefix 命中或 @bot 决定；
 //     触发命中但正文为空时会用 emptyTriggerPlaceholder 代替，避免静默丢弃；
 //  5. 构建 InboundMessage，其中 Text 字段是**已经剥离触发标记后**的纯净文本。
 func decodeAndFilter(raw []byte, selfID int64, tr config.Trigger, blacklist config.Blacklist) (*domain.InboundMessage, error) {
@@ -102,7 +102,7 @@ func decodeAndFilter(raw []byte, selfID int64, tr config.Trigger, blacklist conf
 		var prefixMatched bool
 		plainText, prefixMatched = matchPrefix(plainText, tr.Prefix)
 		if !atSelf && !prefixMatched {
-			// 无论 GroupAtOnly 是否开启，没命中前缀/@ 时都不触发——
+			// 没命中前缀/@ 时都不触发——
 			// 群内闲聊若全部触发会被洗版。
 			return nil, nil
 		}

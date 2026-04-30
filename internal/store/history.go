@@ -116,6 +116,23 @@ func (r *redisHistoryRepo) Append(ctx context.Context, sessionID string, msg *sc
 //
 // 注意返回顺序：Redis 中 index 0 是最新消息（LPUSH 的特性），但 LLM 需要
 // 的是"从旧到新"的历史序列，所以读取后要反转一次。
+//
+// 时间戳前缀化（"写读不对称"约束）：
+//   - schema.Message 自身没有时间字段（eino@v0.8.11/schema/message.go 仅有
+//     Role/Content/Name/MultiContent…），想让 LLM"看见"消息发生的时间，唯一
+//     可行的注入点就是 Content。这里在 Load 返回时给每条消息的 Content 拼一个
+//     `[YYYY-MM-DD HH:MM] ` 前缀（本地时区，分钟精度），proactive generator /
+//     主链 buildMessages 等所有读历史的地方自动受益。
+//   - 关键约束：写入路径完全不沾这件事——Append 收到的 *schema.Message.Content
+//     仍是纯净文本，落到 Redis 里的 historyEntry.Content 也是纯净文本，时间戳
+//     单独保存在 historyEntry.Time。前缀只在 Load 出口处即时拼接。
+//   - 因此调用方拿到 Load 结果后，**不能再原样 Append 回去**，否则历史里会
+//     出现 "[2026-04-30 14:30] [2026-04-29 09:12] 你好" 这种叠加前缀的污染。
+//     当前代码不存在这种环路（saveHistory 写入的来源是 flow.Input.Query / 状态机
+//     的纯净 Reply，永远不取自 Load）；将来若加 RAG/摘要把 Load 结果回灌写回，
+//     必须在注入点先剥掉这层前缀。
+//   - entry.Time.IsZero() 时跳过前缀，避免出现 `[0001-01-01 00:00]` 这种丑值——
+//     兼容历史损坏 / 早期未带 ts 的旧记录。
 func (r *redisHistoryRepo) Load(ctx context.Context, sessionID string, n int) ([]*schema.Message, error) {
 	if n <= 0 {
 		return nil, nil
@@ -134,7 +151,15 @@ func (r *redisHistoryRepo) Load(ctx context.Context, sessionID string, n int) ([
 			// 单条解析失败记录但不阻断；历史损坏不应让当前对话失败。
 			continue
 		}
-		msgs = append(msgs, entry.message())
+		content := entry.Content
+		if !entry.Time.IsZero() {
+			content = "[" + entry.Time.Local().Format("2006-01-02 15:04") + "] " + content
+		}
+		msgs = append(msgs, &schema.Message{
+			Role:    schema.RoleType(entry.Role),
+			Content: content,
+			Name:    entry.Name,
+		})
 	}
 	return msgs, nil
 }
@@ -142,12 +167,4 @@ func (r *redisHistoryRepo) Load(ctx context.Context, sessionID string, n int) ([
 // keyFor 构造某个 sessionID 对应的 Redis key。
 func (r *redisHistoryRepo) keyFor(sessionID string) string {
 	return r.keyPrefix + sessionID
-}
-
-func (e historyEntry) message() *schema.Message {
-	return &schema.Message{
-		Role:    schema.RoleType(e.Role),
-		Content: e.Content,
-		Name:    e.Name,
-	}
 }

@@ -69,48 +69,28 @@ type Memory struct {
 }
 
 // Proactive 控制主动发消息的静态策略。YAML 只保存部署期参数；
-// 运行期开关和群白名单保存在 Redis，避免改配置文件才能临时停用某个群。
+// 运行期开关保存在 Redis（key `bot_proactive_enabled`），避免改配置文件
+// 才能临时停用主动发送。
 //
-// 只有 Enabled=true 且 Redis 开关也开启时，scheduler 才会尝试发送。
+// 决策面只剩"群冷却 + 时间窗 + Redis 开关"三件事；好感度排行 / 白名单 /
+// 日限额 / 会话冷却 / 用户活跃时间窗等参数都已删除：群冷却阈值本身就是
+// 频率约束，"群里 1h 没人和我对话才主动开口"在直觉上也容易解释。
+//
 // 这里的时间字段保留为秒数，是为了让配置文件易读；对外统一通过方法转成
 // time.Duration，避免调用方散落重复换算。
 type Proactive struct {
-	// Enabled 是配置侧总开关；关闭时不构造主动消息调度链路。
-	Enabled bool `yaml:"enabled"`
-	// PromptFile 是主动消息生成提示词 YAML 文件路径；仅在 Enabled=true 时读取。
+	// PromptFile 是主动消息生成提示词 YAML 文件路径。
 	PromptFile string `yaml:"prompt_file"`
 	// WindowStart / WindowEnd 是每天允许主动发送的时间窗边界，格式为 HH:MM。
 	// 默认允许跨天窗口（例如 10:00 到 01:00），以覆盖深夜仍活跃的群。
 	WindowStart string `yaml:"window_start"`
 	WindowEnd   string `yaml:"window_end"`
-	// MinSinceLastInboundSec 要求用户最后发言至少过去多久，避免刚聊完就追发。
-	MinSinceLastInboundSec int `yaml:"min_since_last_inbound_sec"`
-	// MaxSinceLastInboundSec 要求用户最后发言不能太久远，避免打扰已经沉寂的会话。
-	MaxSinceLastInboundSec int `yaml:"max_since_last_inbound_sec"`
 	// IntervalSec 是调度器基础扫描间隔；真实间隔还会叠加 JitterMaxSec 抖动。
 	IntervalSec int `yaml:"interval_sec"`
 	// JitterMaxSec 是每轮调度额外随机等待的上限，用来打散固定整点发送痕迹。
 	JitterMaxSec int `yaml:"jitter_max_sec"`
-	// TopN 限制每轮只从最近最相关的一批候选中挑选，避免全量扫描 Redis 排行。
-	TopN int `yaml:"top_n"`
-	// DailyLimit 限制单日主动发送总量，防止异常配置或模型输出造成刷屏。
-	DailyLimit int `yaml:"daily_limit"`
-	// SessionCooldownSec 限制同一会话的主动发送频率。
-	SessionCooldownSec int `yaml:"session_cooldown_sec"`
-	// RecentEventsCap 限制每个会话记录的近期事件数量，控制候选选择时的 Redis 成本。
-	RecentEventsCap int `yaml:"recent_events_cap"`
-	// DryRun 只生成和记录决策，不真正发送；用于上线前观察候选质量。
-	DryRun bool `yaml:"dry_run"`
-}
-
-// MinSinceLastInbound 返回用户最后发言的最短间隔。
-func (p Proactive) MinSinceLastInbound() time.Duration {
-	return seconds(p.MinSinceLastInboundSec)
-}
-
-// MaxSinceLastInbound 返回用户最后发言的最长间隔。
-func (p Proactive) MaxSinceLastInbound() time.Duration {
-	return seconds(p.MaxSinceLastInboundSec)
+	// IdleThresholdSec 是"群里多久没人和 bot 说话才主动开口"的阈值。
+	IdleThresholdSec int `yaml:"idle_threshold_sec"`
 }
 
 // Interval 返回主动调度的基础间隔。
@@ -123,9 +103,9 @@ func (p Proactive) JitterMax() time.Duration {
 	return seconds(p.JitterMaxSec)
 }
 
-// SessionCooldown 返回同一 session 的主动发送冷却时间。
-func (p Proactive) SessionCooldown() time.Duration {
-	return seconds(p.SessionCooldownSec)
+// IdleThreshold 返回群冷却阈值。
+func (p Proactive) IdleThreshold() time.Duration {
+	return seconds(p.IdleThresholdSec)
 }
 
 // Server 描述对外提供的 HTTP / WebSocket 服务。
@@ -196,8 +176,6 @@ type Guard struct {
 type Trigger struct {
 	// Private 为 true 时，所有私聊消息都直接触发。
 	Private bool `yaml:"private"`
-	// GroupAtOnly 为 true 时，群聊消息必须 @ 机器人才触发。
-	GroupAtOnly bool `yaml:"group_at_only"`
 	// Prefix 是显式命令前缀，命中时即便不 @ 也会触发。
 	Prefix []string `yaml:"prefix"`
 }
@@ -333,19 +311,12 @@ func (c *Config) normalizeBlacklist() {
 
 func defaultProactive() Proactive {
 	return Proactive{
-		Enabled:                false,
-		PromptFile:             "configs/prompts/proactive.yaml",
-		WindowStart:            "10:00",
-		WindowEnd:              "01:00",
-		MinSinceLastInboundSec: int((1 * time.Hour) / time.Second),
-		MaxSinceLastInboundSec: int((6 * time.Hour) / time.Second),
-		IntervalSec:            int((1 * time.Hour) / time.Second),
-		JitterMaxSec:           int((10 * time.Minute) / time.Second),
-		TopN:                   50,
-		DailyLimit:             3,
-		SessionCooldownSec:     int((6 * time.Hour) / time.Second),
-		RecentEventsCap:        200,
-		DryRun:                 true,
+		PromptFile:       "configs/prompts/proactive.yaml",
+		WindowStart:      "10:00",
+		WindowEnd:        "01:00",
+		IntervalSec:      int((10 * time.Minute) / time.Second),
+		JitterMaxSec:     int((1 * time.Minute) / time.Second),
+		IdleThresholdSec: int((1 * time.Hour) / time.Second),
 	}
 }
 
@@ -369,29 +340,14 @@ func (c *Config) validateProactive() error {
 	if c.Proactive.WindowEnd == "" {
 		c.Proactive.WindowEnd = defaults.WindowEnd
 	}
-	if c.Proactive.MinSinceLastInboundSec <= 0 {
-		c.Proactive.MinSinceLastInboundSec = defaults.MinSinceLastInboundSec
-	}
-	if c.Proactive.MaxSinceLastInboundSec <= 0 {
-		c.Proactive.MaxSinceLastInboundSec = defaults.MaxSinceLastInboundSec
-	}
 	if c.Proactive.IntervalSec <= 0 {
 		c.Proactive.IntervalSec = defaults.IntervalSec
 	}
 	if c.Proactive.JitterMaxSec < 0 {
 		return fmt.Errorf("config: proactive.jitter_max_sec must be >= 0")
 	}
-	if c.Proactive.TopN <= 0 {
-		c.Proactive.TopN = defaults.TopN
-	}
-	if c.Proactive.DailyLimit <= 0 {
-		c.Proactive.DailyLimit = defaults.DailyLimit
-	}
-	if c.Proactive.SessionCooldownSec <= 0 {
-		c.Proactive.SessionCooldownSec = defaults.SessionCooldownSec
-	}
-	if c.Proactive.RecentEventsCap <= 0 {
-		c.Proactive.RecentEventsCap = defaults.RecentEventsCap
+	if c.Proactive.IdleThresholdSec <= 0 {
+		c.Proactive.IdleThresholdSec = defaults.IdleThresholdSec
 	}
 
 	if _, err := time.Parse("15:04", c.Proactive.WindowStart); err != nil {
@@ -399,9 +355,6 @@ func (c *Config) validateProactive() error {
 	}
 	if _, err := time.Parse("15:04", c.Proactive.WindowEnd); err != nil {
 		return fmt.Errorf("config: proactive.window_end must use HH:MM: %w", err)
-	}
-	if c.Proactive.MinSinceLastInboundSec > c.Proactive.MaxSinceLastInboundSec {
-		return fmt.Errorf("config: proactive.min_since_last_inbound_sec must be <= proactive.max_since_last_inbound_sec")
 	}
 	return nil
 }

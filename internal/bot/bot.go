@@ -32,9 +32,9 @@ const sendDeadlineReserve = 300 * time.Millisecond
 
 // Bot 聚合 Adapter 与 Runnable，是整个服务的"大主循环"载体。
 //
-// activityRecorder 直接持有 *proactive.ActivityRecorder：proactive 关闭时
-// main 传 nil 进来，handle 中的 nil-check 会跳过；这条旁路记录的具体写入
-// 行为（Redis key、白名单、软降级）都收敛在 proactive 包里。
+// activityRecorder 直接持有 *proactive.ActivityRecorder：由 main 装配，恒非
+// nil；这条旁路记录的具体写入行为（Redis key、白名单、软降级）都收敛在
+// proactive 包里。
 type Bot struct {
 	adapter  adapter.Adapter
 	runnable agent.Runnable
@@ -48,8 +48,9 @@ type Bot struct {
 // New 构造一个 Bot。
 //
 // ad 可以是任何满足 adapter.Adapter 的实现；rn 是 agent.Build 的返回值。
-// recorder 为 nil 表示主动消息功能关闭。stats 打分由 Agent Graph 的
-// scoreStats 节点在"回复已生成"时触发，Bot 只负责发送。
+// recorder 由 main 装配，恒非 nil；运行期是否真的发主动消息由 Redis
+// `bot_proactive_enabled` 决定。stats 打分由 Agent Graph 的 scoreStats
+// 节点在"回复已生成"时触发，Bot 只负责发送。
 func New(ad adapter.Adapter, rn agent.Runnable, recorder *proactive.ActivityRecorder, logger *slog.Logger) *Bot {
 	return &Bot{
 		adapter:          ad,
@@ -115,11 +116,9 @@ func (b *Bot) handle(parent context.Context, m *domain.InboundMessage) {
 		slog.String("session", m.SessionID),
 		slog.String("user", m.UserID))
 
-	if b.activityRecorder != nil {
-		// 先记录活跃再进 Graph：即便后续 LLM 调用失败，"这个人刚来过"仍是事实。
-		// 记录接口不返回错误，主动消息索引故障只在实现侧降级。
-		b.activityRecorder.RecordInbound(ctx, m)
-	}
+	// 先记录活跃再进 Graph：即便后续 LLM 调用失败，"这个人刚来过"仍是事实。
+	// 记录接口不返回错误，主动消息索引故障只在实现侧降级。
+	b.activityRecorder.RecordInbound(ctx, m)
 
 	// 步骤 1：构造 Graph 入参。
 	// UserID 透传给 Graph：stats 按人头维度读写（好感度的 ZSET member 形如

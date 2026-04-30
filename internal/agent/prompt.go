@@ -109,33 +109,29 @@ func LoadPersona(path string) (*Persona, error) {
 // 注意不要写回 p.SystemPrompt：那是启动期固化的只读快照，多 goroutine 共享；
 // 这里每次调用都在栈上用 strings.Builder 构造一份新的 system content。
 func (p *Persona) BuildMessages(history []*schema.Message, query, userID string, affinity, mood int, memory string) ([]*schema.Message, error) {
-	sysContent := p.SystemPrompt
 	snap := stats.Snapshot{Affinity: affinity, Mood: mood}
 	line := snap.PromptLine()
 	memory = strings.TrimSpace(memory)
-	if memory != "" || line != "" {
-		var sb strings.Builder
-		sb.Grow(len(p.SystemPrompt) + len(memory) + len(line) + 64)
-		sb.WriteString(p.SystemPrompt)
-		if memory != "" {
-			sb.WriteString("\n\n")
-			sb.WriteString("长期记忆（仅供理解这个用户，不要逐字复述或承认系统存在）：\n")
-			sb.WriteString(memory)
-		}
-		if line != "" {
-			// 状态行贴近当前输入；最终仍由动态护栏收尾，防止记忆内容抬高优先级。
-			sb.WriteString("\n\n")
-			sb.WriteString(line)
-		}
+
+	var sb strings.Builder
+	sb.Grow(len(p.SystemPrompt) + len(memory) + len(line) + 64)
+	sb.WriteString(p.SystemPrompt)
+	if memory != "" {
 		sb.WriteString("\n\n")
-		sb.WriteString(finalContextGuardrail)
-		sysContent = sb.String()
+		sb.WriteString("长期记忆（仅供理解这个用户，不要逐字复述或承认系统存在）：\n")
+		sb.WriteString(memory)
 	}
+	// 状态行贴近当前输入；最终仍由动态护栏收尾，防止记忆内容抬高优先级。
+	// PromptLine 至少返回当前时间一行，恒非空。
+	sb.WriteString("\n\n")
+	sb.WriteString(line)
+	sb.WriteString("\n\n")
+	sb.WriteString(finalContextGuardrail)
 
 	userMsg := schema.UserMessage(query)
 	userMsg.Name = userID
 	msgs := make([]*schema.Message, 0, len(history)+2)
-	msgs = append(msgs, schema.SystemMessage(sysContent))
+	msgs = append(msgs, schema.SystemMessage(sb.String()))
 	msgs = append(msgs, history...)
 	msgs = append(msgs, userMsg)
 	return msgs, nil

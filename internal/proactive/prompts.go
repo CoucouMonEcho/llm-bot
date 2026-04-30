@@ -5,7 +5,6 @@ import (
 	"os"
 	"strings"
 
-	"github.com/echo/llm-bot/internal/domain"
 	"gopkg.in/yaml.v3"
 )
 
@@ -13,24 +12,26 @@ type generatorPromptsFile struct {
 	Generator GeneratorPrompts `yaml:"generator"`
 }
 
-// GeneratorPrompts contains the text contracts used by the proactive generator.
-// Values are loaded once at startup and treated as immutable afterwards.
+// GeneratorPrompts 是主动消息生成器的文本契约。
+//
+// 加载一次即固化到内存，运行期不再 IO。当前主动消息只面向群聊，因此 user
+// prompt 只剩"当前时间 + 群里上次互动时间 + 历史"三块。
 type GeneratorPrompts struct {
 	System             string              `yaml:"system"`
 	ForbiddenFragments []string            `yaml:"forbidden_fragments"`
 	UserPrompt         GeneratorUserPrompt `yaml:"user_prompt"`
 }
 
+// GeneratorUserPrompt 列出渲染主动开场白用户消息的全部 label。
+//
+// 字段会在 normalized 时校验非空——所有 label 都是契约的一部分，缺一项就
+// 让装配期直接失败，避免运行期才发现 prompt 拼出空字符串。
 type GeneratorUserPrompt struct {
-	CurrentTimeLabel         string            `yaml:"current_time_label"`
-	ConversationTypeLabel    string            `yaml:"conversation_type_label"`
-	PrivateDisplayNameLabel  string            `yaml:"private_display_name_label"`
-	LastInboundAtLabel       string            `yaml:"last_inbound_at_label"`
-	RecentGroupActivityLabel string            `yaml:"recent_group_activity_label"`
-	HistoryHeader            string            `yaml:"history_header"`
-	NoHistoryText            string            `yaml:"no_history_text"`
-	Closing                  string            `yaml:"closing"`
-	ConversationTypes        map[string]string `yaml:"conversation_types"`
+	CurrentTimeLabel   string `yaml:"current_time_label"`
+	LastInboundAtLabel string `yaml:"last_inbound_at_label"`
+	HistoryHeader      string `yaml:"history_header"`
+	NoHistoryText      string `yaml:"no_history_text"`
+	Closing            string `yaml:"closing"`
 }
 
 func LoadGeneratorPrompts(path string) (GeneratorPrompts, error) {
@@ -67,10 +68,7 @@ func (p GeneratorPrompts) normalized() (GeneratorPrompts, error) {
 		value *string
 	}{
 		{"generator.user_prompt.current_time_label", &up.CurrentTimeLabel},
-		{"generator.user_prompt.conversation_type_label", &up.ConversationTypeLabel},
-		{"generator.user_prompt.private_display_name_label", &up.PrivateDisplayNameLabel},
 		{"generator.user_prompt.last_inbound_at_label", &up.LastInboundAtLabel},
-		{"generator.user_prompt.recent_group_activity_label", &up.RecentGroupActivityLabel},
 		{"generator.user_prompt.history_header", &up.HistoryHeader},
 		{"generator.user_prompt.no_history_text", &up.NoHistoryText},
 		{"generator.user_prompt.closing", &up.Closing},
@@ -79,13 +77,6 @@ func (p GeneratorPrompts) normalized() (GeneratorPrompts, error) {
 		*field.value = strings.TrimSpace(*field.value)
 		if *field.value == "" {
 			return GeneratorPrompts{}, fmt.Errorf("%s is required", field.name)
-		}
-	}
-
-	p.UserPrompt.ConversationTypes = normalizeMap(p.UserPrompt.ConversationTypes)
-	for _, key := range []string{string(domain.ConversationGroup), string(domain.ConversationPrivate)} {
-		if p.UserPrompt.ConversationTypes[key] == "" {
-			return GeneratorPrompts{}, fmt.Errorf("generator.user_prompt.conversation_types.%s is required", key)
 		}
 	}
 	return p, nil
@@ -97,18 +88,6 @@ func normalizeList(values []string) []string {
 		value = strings.TrimSpace(value)
 		if value != "" {
 			out = append(out, value)
-		}
-	}
-	return out
-}
-
-func normalizeMap(values map[string]string) map[string]string {
-	out := make(map[string]string, len(values))
-	for key, value := range values {
-		key = strings.TrimSpace(key)
-		value = strings.TrimSpace(value)
-		if key != "" && value != "" {
-			out[key] = value
 		}
 	}
 	return out

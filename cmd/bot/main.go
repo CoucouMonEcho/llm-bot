@@ -9,7 +9,7 @@
 //  6. 构造 stats / memory 资源（若启用）：Store、prompt 与异步更新 ChatModel；
 //  7. 构造 Agent Runnable（这一步会构造主/裁判 ChatModel、编译 Graph）；
 //  8. 构造 OneBot Adapter；
-//  9. 构造主动消息资源（若启用）；
+//  9. 构造主动消息资源（始终构造，运行期由 Redis 开关控制）；
 //  10. 启动主动调度并把 Bot 主循环跑起来；
 //  11. 监听 SIGINT/SIGTERM 做优雅关闭。
 package main
@@ -136,21 +136,20 @@ func main() {
 		fatal("start adapter: %v", err)
 	}
 
-	// 步骤 9：构造主动消息组件（若启用）。
-	// Bot 层拿到具体的 *proactive.ActivityRecorder（关闭时为 nil），用来旁路
-	// 记录真实入站活跃；主动消息的候选选择、去重、冷却、dry-run 与 Redis key
-	// 都留在 proactive 包内。Scheduler 在 Adapter start 之后再启动，因为它需
-	// 要把生成结果通过同一个 Adapter 发回平台。
-	activityRecorder, proactiveScheduler, err := buildProactive(ctx, cfg, redisCli, historyRepo, statsStore, ad, logger)
+	// 步骤 9：构造主动消息组件。
+	// 主动消息组件始终构造，运行期由 Redis bot_proactive_enabled 控制是否真发；
+	// Bot 层拿到具体的 *proactive.ActivityRecorder 用来旁路记录真实入站活跃，
+	// 群冷却阈值、时间窗与 Redis key 都留在 proactive 包内。
+	// Scheduler 在 Adapter start 之后再启动，因为它需要把生成结果通过同一个
+	// Adapter 发回平台。
+	activityRecorder, proactiveScheduler, err := buildProactive(ctx, cfg, redisCli, historyRepo, ad, logger)
 	if err != nil {
 		fatal("%v", err)
 	}
 
 	// 步骤 10：启动主动调度并跑主循环。
-	if proactiveScheduler != nil {
-		// 主动调度与主循环共享同一个 ctx：进程收到退出信号时两条链路一起停。
-		go proactiveScheduler.Run(ctx)
-	}
+	// 主动调度与主循环共享同一个 ctx：进程收到退出信号时两条链路一起停。
+	go proactiveScheduler.Run(ctx)
 	b := bot.New(ad, runnable, activityRecorder, logger)
 	b.Run(ctx) // 阻塞直到 ctx 被取消
 
@@ -198,18 +197,14 @@ func buildMemory(cfg *config.Config, redisCli *redis.Client, logger *slog.Logger
 
 // buildProactive 构造主动消息所需的 ActivityRecorder 与 Scheduler。
 //
-// 关闭时全部返回 nil；Bot 拿到 nil ActivityRecorder 也能正常工作。Sender
+// ActivityRecorder 与 Scheduler 始终构造（永不返回 nil），运行期是否真正
+// 发送由 Redis 上的 `bot_proactive_enabled` 控制，未设值默认关闭。Sender
 // 作为参数传入，是因为只有 Adapter 自己知道怎么把消息发回平台，proactive
-// 内部不绑定 onebot 实现。statsStore 提供好感度排行；为 nil 时 Selector 的
-// 第一阶段会自动跳过。
-func buildProactive(ctx context.Context, cfg *config.Config, redisCli *redis.Client, historyRepo store.HistoryRepo, statsStore *stats.Store, sender proactive.Sender, logger *slog.Logger) (*proactive.ActivityRecorder, *proactive.Scheduler, error) {
-	if !cfg.Proactive.Enabled {
-		return nil, nil, nil
-	}
+// 内部不绑定 onebot 实现。historyRepo 仍传给 Generator——开场白会读最近
+// 几条群历史作为语气参考。
+func buildProactive(ctx context.Context, cfg *config.Config, redisCli *redis.Client, historyRepo store.HistoryRepo, sender proactive.Sender, logger *slog.Logger) (*proactive.ActivityRecorder, *proactive.Scheduler, error) {
 	state := proactive.NewState(redisCli, logger)
-	recorder := proactive.NewActivityRecorder(state, logger, proactive.RecorderConfig{
-		RecentGroupEventCap: cfg.Proactive.RecentEventsCap,
-	})
+	recorder := proactive.NewActivityRecorder(state, logger)
 
 	proactiveModel, err := agent.NewChatModel(ctx, cfg.LLM)
 	if err != nil {
@@ -222,22 +217,14 @@ func buildProactive(ctx context.Context, cfg *config.Config, redisCli *redis.Cli
 	// HistorySize / MaxHistoryChars 直接在装配点固化：proactive 包内不再保留
 	// 默认值常量，main 是唯一选择"取多少历史给主动开场白参考"的地方。
 	proactiveCfg := proactive.Config{
-		Enabled:         cfg.Proactive.Enabled,
 		WindowStart:     cfg.Proactive.WindowStart,
 		WindowEnd:       cfg.Proactive.WindowEnd,
 		Interval:        cfg.Proactive.Interval(),
 		Jitter:          cfg.Proactive.JitterMax(),
-		DailyLimit:      cfg.Proactive.DailyLimit,
-		DryRun:          cfg.Proactive.DryRun,
-		AffinityTopN:    cfg.Proactive.TopN,
-		MinSinceLast:    cfg.Proactive.MinSinceLastInbound(),
-		MaxSinceLast:    cfg.Proactive.MaxSinceLastInbound(),
-		RecentEventScan: cfg.Proactive.RecentEventsCap,
-		SessionCooldown: cfg.Proactive.SessionCooldown(),
+		IdleThreshold:   cfg.Proactive.IdleThreshold(),
 		HistorySize:     6,
 		MaxHistoryChars: 1200,
 	}
-	selector := proactive.NewSelector(state, statsStore, logger, proactiveCfg)
 	generator := proactive.NewGenerator(proactive.GeneratorOptions{
 		Model:   proactiveModel,
 		History: historyRepo,
@@ -247,13 +234,12 @@ func buildProactive(ctx context.Context, cfg *config.Config, redisCli *redis.Cli
 	})
 	scheduler := proactive.NewScheduler(proactive.Options{
 		State:     state,
-		Selector:  selector,
 		Generator: generator,
 		Sender:    sender,
 		Logger:    logger,
 		Config:    proactiveCfg,
 	})
-	logger.Info("proactive feature enabled", slog.Bool("dry_run", cfg.Proactive.DryRun))
+	logger.Info("proactive scheduler started")
 	return recorder, scheduler, nil
 }
 
