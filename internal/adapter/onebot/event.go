@@ -57,17 +57,17 @@ type messageSegment struct {
 
 // decodeAndFilter 把一条原始 JSON 事件解码为 domain.InboundMessage。
 //
-// 本函数在 Adapter 中作为"源头过滤器"使用：非触发事件会返回 (nil, nil)
+// 本函数在 Adapter 中作为"源头过滤器"使用：应忽略事件会返回 (nil, nil)
 // 而不是错误；调用方据此区分"应当忽略"和"应当打日志的解码错误"。
 //
 // 处理步骤：
 //  1. JSON 解码到 rawEvent；
 //  2. 只接受 post_type == "message" 的事件，其他（心跳、元事件）全部忽略；
 //  3. 按 blacklist.user_ids 过滤用户；
-//  4. 根据配置的 trigger 规则判断"该不该理"——
+//  4. 根据配置的 trigger 规则判断触发元信息——
 //     4.1 私聊：按 trigger.Private 决定；
-//     4.2 群聊：先剥离 @bot 段，随后按 prefix 命中或 @bot 决定；
-//     触发命中但正文为空时会用 emptyTriggerPlaceholder 代替，避免静默丢弃；
+//     4.2 群聊：保留普通文本消息；若 @bot 或命中 prefix，则标记 ExplicitTrigger；
+//     显式触发但正文为空时会用 emptyTriggerPlaceholder 代替，避免静默丢弃；
 //  5. 构建 InboundMessage，其中 Text 字段是**已经剥离触发标记后**的纯净文本。
 func decodeAndFilter(raw []byte, selfID int64, tr config.Trigger, blacklist config.Blacklist) (*domain.InboundMessage, error) {
 	var ev rawEvent
@@ -90,23 +90,18 @@ func decodeAndFilter(raw []byte, selfID int64, tr config.Trigger, blacklist conf
 		return nil, fmt.Errorf("onebot: extract text: %w", err)
 	}
 
-	// Step 4: 按会话类型与配置做触发过滤。
-	groupTriggered := false
+	// Step 4: 按会话类型与配置做触发过滤，并记录显式触发元信息。
+	explicitTrigger := false
 	switch ev.MessageType {
 	case "private":
 		if !tr.Private {
 			return nil, nil
 		}
 	case "group":
-		// 群聊触发条件：@bot 或 以任一前缀开头（二者任一满足）。
+		// 群聊普通文本也会进入下游；@bot 或前缀只作为显式触发元信息。
 		var prefixMatched bool
 		plainText, prefixMatched = matchPrefix(plainText, tr.Prefix)
-		if !atSelf && !prefixMatched {
-			// 没命中前缀/@ 时都不触发——
-			// 群内闲聊若全部触发会被洗版。
-			return nil, nil
-		}
-		groupTriggered = true
+		explicitTrigger = atSelf || prefixMatched
 	default:
 		// 其他消息类型（比如 discuss 已弃用）一律忽略。
 		return nil, nil
@@ -114,8 +109,8 @@ func decodeAndFilter(raw []byte, selfID int64, tr config.Trigger, blacklist conf
 
 	plainText = strings.TrimSpace(plainText)
 	if plainText == "" {
-		if !groupTriggered {
-			// 私聊里发来的纯空白消息：罕见，静默忽略。
+		if !explicitTrigger {
+			// 私聊或普通群聊的纯空白消息：罕见，静默忽略。
 			return nil, nil
 		}
 		// 群聊 @ / 前缀已命中但正文为空（典型"只点了 @ 没打字"），
@@ -136,13 +131,14 @@ func decodeAndFilter(raw []byte, selfID int64, tr config.Trigger, blacklist conf
 	userName := cmp.Or(ev.Sender.Card, ev.Sender.Nickname)
 
 	return &domain.InboundMessage{
-		Platform:  domain.PlatformOneBot,
-		ConvType:  convType,
-		SessionID: sessionID,
-		UserID:    strconv.FormatInt(ev.UserID, 10),
-		UserName:  userName,
-		MessageID: strconv.FormatInt(ev.MessageID, 10),
-		Text:      plainText,
+		Platform:        domain.PlatformOneBot,
+		ConvType:        convType,
+		SessionID:       sessionID,
+		UserID:          strconv.FormatInt(ev.UserID, 10),
+		UserName:        userName,
+		MessageID:       strconv.FormatInt(ev.MessageID, 10),
+		Text:            plainText,
+		ExplicitTrigger: explicitTrigger,
 	}, nil
 }
 

@@ -56,10 +56,19 @@ guard:
     - "达咩哟 达咩"
     - "听不懂喵"
 
-# 触发规则：在 Adapter 层做源头过滤，未命中的事件根本不进入 Receive 通道。
+# 触发规则：Adapter 标记显式触发，并保留群聊普通文本供后续跟进判断。
 trigger:
-  private:       true        # 私聊消息一律触发
-  prefix:        ["/bot"]    # 显式前缀（群聊可绕过 @ 限制）
+  private:            true        # 私聊消息一律触发
+  prefix:             ["/bot"]    # 显式前缀（群聊可绕过 @ 限制）
+  group_followup_sec: 90          # 群聊普通消息跟进窗口；<=0 表示关闭
+
+# 群聊短期上下文缓存：保存最近若干条普通群消息（不进历史也不入个人上下文），
+# 仅用于 @bot 时作为"刚才大家在聊什么"的背景注入。
+# Redis 写入侧靠 LPUSH+LTRIM+EXPIRE 自然控制规模；读取侧不再叠加任何过滤。
+group_buffer:
+  enabled:      true
+  max_messages: 20      # 单群最多保留 20 条普通消息
+  ttl_sec:      600     # 每次写入后刷新 10 分钟过期
 
 # 黑名单：命中后在 Adapter 源头忽略，不进入历史、stats 或 LLM 调用。
 blacklist:
@@ -94,4 +103,4 @@ proactive:
   window_end: "01:00"
   interval_sec: 600         # 每轮等待 10 分钟
   jitter_max_sec: 60        # 抖动上限 1 分钟
-  idle_threshold_sec: 3600  # 群里 1h 没人和我对话才主动开口
+  idle_threshold_sec: 3600  # 群里 1h 没人说话才主动开口

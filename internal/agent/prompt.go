@@ -97,29 +97,42 @@ func LoadPersona(path string) (*Persona, error) {
 // 历史中的不同用户在模型输入里可区分，同时避免把昵称或来源前缀污染到正文。
 //
 // affinity / mood 是本轮的人设参数平铺值（由调用方从 stats.Store 读出后由
-// flow.State 透传）；memory 是本轮用户长期事实摘要，由 memory.Store 读出注入。
-// 本方法不感知 Redis，只负责把这两段上下文用双换行隔离地拼到 SystemPrompt 末
-// 尾，并在最后补一条动态护栏，避免长期记忆内容被当成更高优先级指令。
+// flow.State 透传）；memory 是本轮用户长期事实摘要，由 memory.Store 读出注入；
+// groupBackground 是 loadContext 节点针对群聊会话渲染好的"刚才群里在聊什么"
+// 背景块（私聊或缓存关闭时为空）。本方法不感知 Redis，只负责把这几段上下文
+// 用双换行隔离地拼到 SystemPrompt 末尾，并在最后补一条动态护栏。
+//
+// 群聊背景块只在群聊会话出现，且与长期记忆/状态行/动态护栏一起按
+// "信号 → 当前指令"的顺序排列；动态护栏继续放最后一行，让"长期记忆 / 群聊
+// 背景都是上下文数据"这条约束在模型注意力中处于"最近优先"的位置。
 //
 // 状态行的具体格式由 stats.Snapshot.PromptLine 维护——Snapshot 加字段时只需
 // 改那一个方法，不用碰本文件；本方法只负责把平铺字段重新装回 stats.Snapshot
-// 后委托给 PromptLine 渲染。长期记忆则保持纯文本，避免把"记忆格式"扩散到
-// agent 之外。
+// 后委托给 PromptLine 渲染。长期记忆与群聊背景则保持纯文本，避免把"记忆格式"
+// 扩散到 agent 之外。
 //
 // 注意不要写回 p.SystemPrompt：那是启动期固化的只读快照，多 goroutine 共享；
 // 这里每次调用都在栈上用 strings.Builder 构造一份新的 system content。
-func (p *Persona) BuildMessages(history []*schema.Message, query, userID string, affinity, mood int, memory string) ([]*schema.Message, error) {
+func (p *Persona) BuildMessages(history []*schema.Message, query, userID string, affinity, mood int, memory string, groupBackground string) ([]*schema.Message, error) {
 	snap := stats.Snapshot{Affinity: affinity, Mood: mood}
 	line := snap.PromptLine()
 	memory = strings.TrimSpace(memory)
+	groupBackground = strings.TrimSpace(groupBackground)
 
 	var sb strings.Builder
-	sb.Grow(len(p.SystemPrompt) + len(memory) + len(line) + 64)
+	sb.Grow(len(p.SystemPrompt) + len(memory) + len(groupBackground) + len(line) + 128)
 	sb.WriteString(p.SystemPrompt)
 	if memory != "" {
 		sb.WriteString("\n\n")
 		sb.WriteString("长期记忆（仅供理解这个用户，不要逐字复述或承认系统存在）：\n")
 		sb.WriteString(memory)
+	}
+	// 群聊背景紧跟长期记忆之后、状态行之前：让模型先建立"这是一个用户的画像 +
+	// 群里的氛围"，再读到"当前时间和你与他的关系"，最后才看到动态护栏与本轮 Query。
+	if groupBackground != "" {
+		sb.WriteString("\n\n")
+		sb.WriteString("群里最近的对话片段（仅用于了解氛围，不要逐字复述、不要直接回应不相关用户）：\n")
+		sb.WriteString(groupBackground)
 	}
 	// 状态行贴近当前输入；最终仍由动态护栏收尾，防止记忆内容抬高优先级。
 	// PromptLine 至少返回当前时间一行，恒非空。

@@ -3,8 +3,8 @@
 // Build 负责：
 //  1. 构造主模型 / 裁判模型；
 //  2. 编译正则黑名单、构造 Judge；
-//  3. 把 regexGate / judgeGate / loadContext / buildMessages / chatModel /
-//     postproc / saveHistory / updateMemory / fallback / scoreStats 十个节点
+//  3. 把 regexGate / judgeGate / loadContext / lowStateGate / buildMessages /
+//     chatModel / postproc / saveHistory / updateMemory / fallback / scoreStats 十一个节点
 //     装配成 compose.Graph
 //     并编译为 Runnable；
 //  4. 返回 Runnable 给 Bot 主循环。
@@ -20,7 +20,7 @@
 //	judgeGate ── (攻击) ──► fallback ────────────────┐
 //	  │ (放行)                                       │
 //	  ▼                                              │
-//	loadContext ──► buildMessages ──► chatModel ──► postproc
+//	loadContext ──► lowStateGate ──► buildMessages ──► chatModel ──► postproc
 //	                                                   │
 //	                                                   ▼
 //	                                              saveHistory
@@ -72,6 +72,9 @@ type Deps struct {
 	MemoryModel model.BaseChatModel
 	// MemoryPrompt 是长期记忆更新模型的 system prompt；仅在 MemoryModel 非 nil 时使用。
 	MemoryPrompt string
+	// GroupBuffer 可为 nil，表示关闭群聊短期上下文背景注入。
+	// 节点内部负责跳过 nil。
+	GroupBuffer store.GroupBufferRepo
 }
 
 // Runnable 是 Agent 对外暴露的唯一执行形态。
@@ -83,6 +86,7 @@ const (
 	nodeRegexGate     = "regexGate"
 	nodeJudgeGate     = "judgeGate"
 	nodeLoadContext   = "loadContext"
+	nodeLowStateGate  = "lowStateGate"
 	nodeBuildMessages = "buildMessages"
 	nodeChatModel     = "chatModel"
 	nodePostproc      = "postproc"
@@ -122,7 +126,8 @@ func Build(ctx context.Context, cfg *config.Config, deps Deps) (Runnable, error)
 	// 反向依赖 agent 包（会形成 import 环）。
 	regexGateNode := guard.NewRegexGate(regex, deps.Logger)
 	judgeGateNode := guard.NewJudgeGate(judge, deps.Logger)
-	loadContextNode := nodes.NewLoadContext(deps.Stats, deps.Memory, deps.History, cfg.Memory.MaxChars, cfg.Agent.HistorySize, deps.Logger)
+	loadContextNode := nodes.NewLoadContext(deps.Stats, deps.Memory, deps.History, deps.GroupBuffer, cfg.Memory.MaxChars, cfg.Agent.HistorySize, deps.Logger)
+	lowStateGateNode := nodes.NewLowStateGate()
 	buildMessagesNode := nodes.NewBuildMessages(deps.Persona.BuildMessages)
 	chatModelNode := nodes.NewChatModel(mainModel)
 	postprocNode := nodes.NewPostproc(cfg.Agent.EmptyReplyFallback)
@@ -141,6 +146,7 @@ func Build(ctx context.Context, cfg *config.Config, deps Deps) (Runnable, error)
 		{nodeRegexGate, regexGateNode},
 		{nodeJudgeGate, judgeGateNode},
 		{nodeLoadContext, loadContextNode},
+		{nodeLowStateGate, lowStateGateNode},
 		{nodeBuildMessages, buildMessagesNode},
 		{nodeChatModel, chatModelNode},
 		{nodePostproc, postprocNode},
@@ -155,11 +161,13 @@ func Build(ctx context.Context, cfg *config.Config, deps Deps) (Runnable, error)
 	}
 
 	// 线性边一次性声明：两条 branch 因各自分支不同仍需单独装配。
+	// lowStateGate 抽中不回复时直接返回 error，Graph 中断后 Bot 维持现有静默逻辑。
 	// fallback → scoreStats 而不是 saveHistory，表明"降级路径不经 saveHistory，
 	// 攻击消息不入历史但仍触发回复后打分"是 graph 的显式结构而非副作用。
 	edges := []struct{ from, to string }{
 		{compose.START, nodeRegexGate},
-		{nodeLoadContext, nodeBuildMessages},
+		{nodeLoadContext, nodeLowStateGate},
+		{nodeLowStateGate, nodeBuildMessages},
 		{nodeBuildMessages, nodeChatModel},
 		{nodeChatModel, nodePostproc},
 		{nodePostproc, nodeSaveHistory},
@@ -215,7 +223,7 @@ func Build(ctx context.Context, cfg *config.Config, deps Deps) (Runnable, error)
 	}
 
 	deps.Logger.Info("agent graph compiled",
-		slog.String("main_path", "regexGate->judgeGate->loadContext->buildMessages->chatModel->postproc->saveHistory->updateMemory->scoreStats"),
+		slog.String("main_path", "regexGate->judgeGate->loadContext->lowStateGate->buildMessages->chatModel->postproc->saveHistory->updateMemory->scoreStats"),
 		slog.String("blocked_path", "fallback->scoreStats"),
 		slog.Bool("judge_enabled", cfg.Guard.JudgeEnabled),
 		slog.Int("regex_count", len(cfg.Guard.RegexPatterns)),
@@ -223,7 +231,8 @@ func Build(ctx context.Context, cfg *config.Config, deps Deps) (Runnable, error)
 		slog.Bool("stats_enabled", deps.Stats != nil),
 		slog.Bool("stats_scoring_enabled", deps.Stats != nil && deps.ScoreModel != nil),
 		slog.Bool("memory_enabled", deps.Memory != nil),
-		slog.Bool("memory_update_enabled", deps.Memory != nil && deps.MemoryModel != nil))
+		slog.Bool("memory_update_enabled", deps.Memory != nil && deps.MemoryModel != nil),
+		slog.Bool("group_buffer_enabled", deps.GroupBuffer != nil))
 
 	return runnable, nil
 }

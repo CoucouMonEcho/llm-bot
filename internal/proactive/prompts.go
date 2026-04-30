@@ -15,9 +15,15 @@ type generatorPromptsFile struct {
 // GeneratorPrompts 是主动消息生成器的文本契约。
 //
 // 加载一次即固化到内存，运行期不再 IO。当前主动消息只面向群聊，因此 user
-// prompt 只剩"当前时间 + 群里上次互动时间 + 历史"三块。
+// prompt 只剩"当前时间 + 群里上次活跃时间 + 历史"三块。
+//
+// Examples 只保存"期望输出长什么样"的 assistant 正例字符串列表；运行期会被
+// 渲染成 system prompt 里的结构化 few-shot 段落，而不是伪造多轮 user/assistant
+// 消息——后者会让模型把 synthetic user 误读为当前对话上下文。允许为空，便于
+// 退化到纯规则 prompt。
 type GeneratorPrompts struct {
 	System             string              `yaml:"system"`
+	Examples           []string            `yaml:"examples"`
 	ForbiddenFragments []string            `yaml:"forbidden_fragments"`
 	UserPrompt         GeneratorUserPrompt `yaml:"user_prompt"`
 }
@@ -61,6 +67,9 @@ func (p GeneratorPrompts) normalized() (GeneratorPrompts, error) {
 	if len(p.ForbiddenFragments) == 0 {
 		return GeneratorPrompts{}, fmt.Errorf("generator.forbidden_fragments must contain at least one entry")
 	}
+
+	// examples 是可选项：为空时主动消息回退到纯规则 prompt，不报错。
+	p.Examples = normalizeList(p.Examples)
 
 	up := &p.UserPrompt
 	required := []struct {

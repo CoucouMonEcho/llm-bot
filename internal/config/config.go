@@ -21,18 +21,19 @@ import (
 
 // Config 是整个应用的配置根对象，字段与 configs/config.yaml 一一对应。
 type Config struct {
-	Server    Server    `yaml:"server"`
-	Redis     Redis     `yaml:"redis"`
-	LLM       LLM       `yaml:"llm"`
-	Judge     LLM       `yaml:"judge"`
-	Agent     Agent     `yaml:"agent"`
-	Guard     Guard     `yaml:"guard"`
-	Trigger   Trigger   `yaml:"trigger"`
-	Blacklist Blacklist `yaml:"blacklist"`
-	Log       Log       `yaml:"log"`
-	Stats     Stats     `yaml:"stats"`
-	Memory    Memory    `yaml:"memory"`
-	Proactive Proactive `yaml:"proactive"`
+	Server      Server      `yaml:"server"`
+	Redis       Redis       `yaml:"redis"`
+	LLM         LLM         `yaml:"llm"`
+	Judge       LLM         `yaml:"judge"`
+	Agent       Agent       `yaml:"agent"`
+	Guard       Guard       `yaml:"guard"`
+	Trigger     Trigger     `yaml:"trigger"`
+	GroupBuffer GroupBuffer `yaml:"group_buffer"`
+	Blacklist   Blacklist   `yaml:"blacklist"`
+	Log         Log         `yaml:"log"`
+	Stats       Stats       `yaml:"stats"`
+	Memory      Memory      `yaml:"memory"`
+	Proactive   Proactive   `yaml:"proactive"`
 }
 
 // Blacklist 控制需要在 Adapter 源头忽略的账号。
@@ -74,7 +75,7 @@ type Memory struct {
 //
 // 决策面只剩"群冷却 + 时间窗 + Redis 开关"三件事；好感度排行 / 白名单 /
 // 日限额 / 会话冷却 / 用户活跃时间窗等参数都已删除：群冷却阈值本身就是
-// 频率约束，"群里 1h 没人和我对话才主动开口"在直觉上也容易解释。
+// 频率约束，"群里 1h 没人说话才主动开口"在直觉上也容易解释。
 //
 // 这里的时间字段保留为秒数，是为了让配置文件易读；对外统一通过方法转成
 // time.Duration，避免调用方散落重复换算。
@@ -89,7 +90,7 @@ type Proactive struct {
 	IntervalSec int `yaml:"interval_sec"`
 	// JitterMaxSec 是每轮调度额外随机等待的上限，用来打散固定整点发送痕迹。
 	JitterMaxSec int `yaml:"jitter_max_sec"`
-	// IdleThresholdSec 是"群里多久没人和 bot 说话才主动开口"的阈值。
+	// IdleThresholdSec 是"群里多久没人说话才主动开口"的阈值。
 	IdleThresholdSec int `yaml:"idle_threshold_sec"`
 }
 
@@ -178,7 +179,31 @@ type Trigger struct {
 	Private bool `yaml:"private"`
 	// Prefix 是显式命令前缀，命中时即便不 @ 也会触发。
 	Prefix []string `yaml:"prefix"`
+	// GroupFollowupSec 控制群聊普通消息跟进窗口；<=0 表示关闭。
+	GroupFollowupSec int `yaml:"group_followup_sec"`
 }
+
+// GroupBuffer 控制"群聊短期上下文缓存"。
+//
+// 群里非显式触发的普通消息既不进对话历史、也不入个人长期记忆，但 @bot
+// 时如果完全无视前几句聊天，回复会很突兀。本段只配置容量与生命周期，
+// 真正的写读由 store.GroupBufferRepo 完成。
+//
+// Enabled=false 时上层 Adapter 直接跳过写入，store 也不会被构造，相当于
+// "回复纯靠当前消息，不参考刚才在聊什么"。
+type GroupBuffer struct {
+	// Enabled 是否启用群聊短期上下文。默认 true。
+	Enabled bool `yaml:"enabled"`
+	// MaxMessages 单个群在 Redis List 里保留的最大消息数；
+	// 写入侧靠 LTRIM 自动裁剪。<=0 时回退默认 20。
+	MaxMessages int `yaml:"max_messages"`
+	// TTLSec 每次写入后刷新的滑动过期秒数；<=0 时回退默认 600（10 分钟）。
+	// 短窗口足够覆盖"刚才大家在聊什么"，又能让冷清群里的旧上下文自然消失。
+	TTLSec int `yaml:"ttl_sec"`
+}
+
+// TTL 把 TTLSec 暴露成 time.Duration，避免调用方散落 *time.Second 换算。
+func (g GroupBuffer) TTL() time.Duration { return seconds(g.TTLSec) }
 
 // Log 日志级别配置。
 type Log struct {
@@ -205,8 +230,9 @@ func Load(path string) (*Config, error) {
 	}
 
 	cfg := Config{
-		Proactive: defaultProactive(),
-		Memory:    defaultMemory(),
+		Proactive:   defaultProactive(),
+		Memory:      defaultMemory(),
+		GroupBuffer: defaultGroupBuffer(),
 	}
 	if err := yaml.Unmarshal(raw, &cfg); err != nil {
 		return nil, fmt.Errorf("config: unmarshal %s: %w", path, err)
@@ -286,10 +312,25 @@ func (c *Config) validate() error {
 		return fmt.Errorf("config: guard.fallback_replies must contain at least one entry")
 	}
 	c.normalizeBlacklist()
+	c.normalizeGroupBuffer()
 	if err := c.validateProactive(); err != nil {
 		return err
 	}
 	return nil
+}
+
+// normalizeGroupBuffer 给"群聊短期上下文"做轻量参数兜底。
+//
+// 故意不返回 error：MaxMessages / TTLSec 配错只意味着上下文窗口不理想，
+// 让进程崩在这种纯调参问题上得不偿失，直接拉回默认值即可。
+func (c *Config) normalizeGroupBuffer() {
+	defaults := defaultGroupBuffer()
+	if c.GroupBuffer.MaxMessages <= 0 {
+		c.GroupBuffer.MaxMessages = defaults.MaxMessages
+	}
+	if c.GroupBuffer.TTLSec <= 0 {
+		c.GroupBuffer.TTLSec = defaults.TTLSec
+	}
 }
 
 func (c *Config) normalizeBlacklist() {
@@ -325,6 +366,17 @@ func defaultMemory() Memory {
 		Enabled:          false,
 		UpdatePromptFile: "configs/prompts/memory_update.yaml",
 		MaxChars:         1200,
+	}
+}
+
+// defaultGroupBuffer 给"群聊短期上下文"一份保守可用的默认参数：
+// 启用、保留 20 条、滑动 10 分钟过期。容量与 TTL 都是"看上去够用"的
+// 直觉值，调错了顶多上下文丢一两条，不需要崩进程。
+func defaultGroupBuffer() GroupBuffer {
+	return GroupBuffer{
+		Enabled:     true,
+		MaxMessages: 20,
+		TTLSec:      int((10 * time.Minute) / time.Second),
 	}
 }
 

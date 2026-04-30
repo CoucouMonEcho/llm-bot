@@ -6,8 +6,8 @@
 // 关键设计：
 //  1. Receive 返回只读 channel：adapter 按自己的节奏把解码后的
 //     InboundMessage 投递进来，主循环用 range 消费；
-//  2. "触发过滤"发生在 Adapter 内部——未触发的事件根本不进 channel，
-//     避免下游重复写判断逻辑；
+//  2. Adapter 只做协议解码、黑名单过滤与触发元信息标记；是否进入 Agent
+//     Graph 由 Bot 层结合会话窗口等上下文决定；
 //  3. Send 是同步的：调用返回后消息已经（被业务视为）发送完成。
 package adapter
 
@@ -31,7 +31,7 @@ type Adapter interface {
 	Stop(ctx context.Context) error
 
 	// Receive 返回一个只读 channel，上游用 `for msg := range ad.Receive()` 消费。
-	// adapter 内部的事件解码与触发过滤逻辑决定哪些消息会被投递。
+	// adapter 内部的事件解码与黑名单过滤逻辑决定哪些消息会被投递。
 	// 当 Stop 被调用后，channel 会被关闭，for-range 自然退出。
 	Receive() <-chan *domain.InboundMessage
 

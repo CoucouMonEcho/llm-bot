@@ -1,8 +1,8 @@
 // Package bot 提供最顶层的"消息循环管道"——把 Adapter 的接收
 // 事件灌进 Agent Runnable，把结果回发到 Adapter。
 //
-// 这个包刻意做得很薄。它不应该承载任何业务判断（那些都在 Agent Graph 中），
-// 只管并发调度与错误可观测。
+// 这个包刻意做得很薄。除入站触发 gate 这种进入 Graph 前的流量控制外，
+// 业务判断都应留在 Agent Graph 中；这里主要负责并发调度与错误可观测。
 package bot
 
 import (
@@ -16,8 +16,10 @@ import (
 	"github.com/echo/llm-bot/internal/adapter"
 	"github.com/echo/llm-bot/internal/agent"
 	"github.com/echo/llm-bot/internal/agent/flow"
+	"github.com/echo/llm-bot/internal/config"
 	"github.com/echo/llm-bot/internal/domain"
 	"github.com/echo/llm-bot/internal/proactive"
+	"github.com/echo/llm-bot/internal/store"
 )
 
 // maxConcurrent 单进程同时处理的最大消息数。
@@ -42,7 +44,23 @@ type Bot struct {
 
 	activityRecorder *proactive.ActivityRecorder
 
+	// groupBuffer 是"群聊短期上下文"的写入端，可为 nil。
+	// 为 nil 时表示该功能在 main 装配阶段被关闭，Bot 完全不调用，
+	// 等价于关闭群聊背景注入；非 nil 时仅在被 follow-up gate 决定
+	// 不进 Graph 的群聊普通消息上做 Append（详见 cacheGroupBackground）。
+	groupBuffer store.GroupBufferRepo
+
+	followupWindow time.Duration
+	followups      map[followupKey]time.Time
+	followupsMu    sync.Mutex
+
+	now func() time.Time
 	sem chan struct{} // 并发信号量
+}
+
+type followupKey struct {
+	sessionID string
+	userID    string
 }
 
 // New 构造一个 Bot。
@@ -51,12 +69,24 @@ type Bot struct {
 // recorder 由 main 装配，恒非 nil；运行期是否真的发主动消息由 Redis
 // `bot_proactive_enabled` 决定。stats 打分由 Agent Graph 的 scoreStats
 // 节点在"回复已生成"时触发，Bot 只负责发送。
-func New(ad adapter.Adapter, rn agent.Runnable, recorder *proactive.ActivityRecorder, logger *slog.Logger) *Bot {
+//
+// groupBuffer 可为 nil：为 nil 时 Bot 完全不调用，等价于关闭"群聊短期
+// 上下文缓存"；非 nil 时仅在 follow-up gate 拦下的群聊普通消息上做一次
+// 旁路 Append——具体见 cacheGroupBackground 注释。
+func New(ad adapter.Adapter, rn agent.Runnable, recorder *proactive.ActivityRecorder, groupBuffer store.GroupBufferRepo, logger *slog.Logger, trigger config.Trigger) *Bot {
+	followupWindow := time.Duration(trigger.GroupFollowupSec) * time.Second
+	if followupWindow < 0 {
+		followupWindow = 0
+	}
 	return &Bot{
 		adapter:          ad,
 		runnable:         rn,
 		logger:           logger.With(slog.String("component", "bot")),
 		activityRecorder: recorder,
+		groupBuffer:      groupBuffer,
+		followupWindow:   followupWindow,
+		followups:        make(map[followupKey]time.Time),
+		now:              time.Now,
 		sem:              make(chan struct{}, maxConcurrent),
 	}
 }
@@ -108,7 +138,7 @@ func (b *Bot) Run(ctx context.Context) {
 // stats 打分不在这里做：Agent Graph 已在回复生成后通过 scoreStats 异步触发，
 // 不再把参数更新绑定到 Adapter 发送成功与否。
 func (b *Bot) handle(parent context.Context, m *domain.InboundMessage) {
-	receivedAt := time.Now()
+	receivedAt := b.currentTime()
 	ctx, cancel := context.WithTimeout(parent, replyTimeout)
 	defer cancel()
 
@@ -119,6 +149,12 @@ func (b *Bot) handle(parent context.Context, m *domain.InboundMessage) {
 	// 先记录活跃再进 Graph：即便后续 LLM 调用失败，"这个人刚来过"仍是事实。
 	// 记录接口不返回错误，主动消息索引故障只在实现侧降级。
 	b.activityRecorder.RecordInbound(ctx, m)
+
+	if !b.shouldInvokeGraph(m, receivedAt) {
+		b.cacheGroupBackground(ctx, m)
+		lg.Debug("message skipped by follow-up gate")
+		return
+	}
 
 	// 步骤 1：构造 Graph 入参。
 	// UserID 透传给 Graph：stats 按人头维度读写（好感度的 ZSET member 形如
@@ -161,6 +197,7 @@ func (b *Bot) handle(parent context.Context, m *domain.InboundMessage) {
 		lg.Error("adapter send failed", slog.Any("err", err))
 		return
 	}
+	b.refreshFollowup(m, b.currentTime())
 
 	// 步骤 4：观测日志——被拦截的路径走 info 以便线上报警，正常路径降到 debug
 	// 避免刷屏。被拦截的具体细节（命中的 pattern、裁判输出）由产生它的节点
@@ -173,6 +210,87 @@ func (b *Bot) handle(parent context.Context, m *domain.InboundMessage) {
 			slog.Int("len", len(state.Reply.Content)))
 	}
 
+}
+
+func (b *Bot) currentTime() time.Time {
+	if b.now != nil {
+		return b.now()
+	}
+	return time.Now()
+}
+
+func (b *Bot) shouldInvokeGraph(m *domain.InboundMessage, now time.Time) bool {
+	if m.ConvType != domain.ConversationGroup {
+		return true
+	}
+	if m.ExplicitTrigger {
+		return true
+	}
+	if b.followupWindow <= 0 || m.SessionID == "" || m.UserID == "" {
+		return false
+	}
+
+	key := followupKey{sessionID: m.SessionID, userID: m.UserID}
+	b.followupsMu.Lock()
+	defer b.followupsMu.Unlock()
+
+	expiresAt, ok := b.followups[key]
+	if !ok {
+		return false
+	}
+	if now.Before(expiresAt) {
+		return true
+	}
+	delete(b.followups, key)
+	return false
+}
+
+// cacheGroupBackground 把一条"被 follow-up gate 决定不进 Graph 的群聊普通消息"
+// 旁路写入群聊短期上下文缓存。
+//
+// 调用约束：本方法只在 handle 中"不进 Graph"的分支被调用，目的是让
+// groupBuffer 里只保留 bot 当时没有正式回应、也不会写进 history 的群聊
+// 普通消息——避免与 saveHistory 写入的对话历史在同一窗口内重复。
+//
+// 失败语义：写入失败仅记一条 debug 日志，不阻断主流程。这条消息本来就
+// 已经被 gate 丢弃，缓存写不下去也不会让用户感知到任何"丢回复"，完全
+// 可降级。groupBuffer == nil 时整段功能关闭，直接返回。
+func (b *Bot) cacheGroupBackground(ctx context.Context, m *domain.InboundMessage) {
+	if b.groupBuffer == nil || m == nil {
+		return
+	}
+	if m.ConvType != domain.ConversationGroup {
+		return
+	}
+	if m.SessionID == "" || m.UserID == "" {
+		return
+	}
+	if strings.TrimSpace(m.Text) == "" {
+		return
+	}
+	if err := b.groupBuffer.Append(ctx, m.SessionID, m.UserID, m.UserName, m.Text); err != nil {
+		b.logger.Debug("group buffer append failed",
+			slog.String("session", m.SessionID),
+			slog.String("user", m.UserID),
+			slog.Any("err", err))
+	}
+}
+
+func (b *Bot) refreshFollowup(m *domain.InboundMessage, now time.Time) {
+	if m.ConvType != domain.ConversationGroup || b.followupWindow <= 0 || m.SessionID == "" || m.UserID == "" {
+		return
+	}
+
+	key := followupKey{sessionID: m.SessionID, userID: m.UserID}
+	b.followupsMu.Lock()
+	defer b.followupsMu.Unlock()
+
+	for k, expiresAt := range b.followups {
+		if !now.Before(expiresAt) {
+			delete(b.followups, k)
+		}
+	}
+	b.followups[key] = now.Add(b.followupWindow)
 }
 
 // targetReplyLatency 是从收到消息到发出回复的目标总耗时。

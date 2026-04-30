@@ -44,6 +44,8 @@ type InboundMessage struct {
 	MessageID string
 	// Text 已去除 @、前缀等的纯净文本，也就是喂给 LLM 的那一段。
 	Text string
+	// ExplicitTrigger 表示平台层显式触发了 bot（例如 @bot 或命令前缀）。
+	ExplicitTrigger bool
 }
 
 // ReplyMode 定义一条外发消息相对原消息的"指向"样式。

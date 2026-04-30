@@ -4,7 +4,7 @@
 //   - `bot_proactive_enabled`：运行期开关（人工写入），只读不写；
 //   - `bot_proactive_group_last_inbound`：HASH，field=`<sessionID>`，
 //     value=Unix 秒。同时承担两份语义：HKEYS 即"已知群集合"、HVALS 即
-//     "群里上一次和 bot 互动的时间"。
+//     "群里上一次真实活跃的时间"。
 //
 // 这一份 HASH 既是写入面（ActivityRecorder 收到群消息时刷新、Scheduler
 // 发送成功后回写防自激发），也是读取面（Scheduler 选最久未活跃的群）。
@@ -31,7 +31,7 @@ const (
 	// keyEnabled 是运行期开关，由运维显式 SET；缺失或非法值都按"关闭"处理。
 	keyEnabled = "bot_proactive_enabled"
 
-	// keyGroupLastInbound 同时承担"已知群集合"与"该群上次互动时间"两份语义。
+	// keyGroupLastInbound 同时承担"已知群集合"与"该群上次真实活跃时间"两份语义。
 	// field 用 sessionID（已带 `group_` 前缀），value 是 Unix 秒。
 	// 一次 HGETALL 即可拿到全部决策依据，避免再开第二份索引去维护一致性。
 	keyGroupLastInbound = "bot_proactive_group_last_inbound"
@@ -71,11 +71,11 @@ func (s *State) Enabled(ctx context.Context) (bool, error) {
 	return enabled, nil
 }
 
-// RecordGroupInbound 记录某个群最近一次和 bot 互动的时间。
+// RecordGroupInbound 记录某个群最近一次真实活跃的时间。
 //
 // 调用点有两个：
-//  1. ActivityRecorder 收到群消息（Adapter 已过滤，必然是 @bot 或前缀触发）；
-//  2. Scheduler 主动发送成功后——语义上"群里和 bot 又互动了一次"，自然防自激发。
+//  1. ActivityRecorder 收到任意群入站消息；
+//  2. Scheduler 主动发送成功后——避免刚主动开口后立刻再次命中冷却。
 //
 // 写入失败由调用方自行降级（旁路写入打 warn 即可），不阻断主对话链路。
 func (s *State) RecordGroupInbound(ctx context.Context, sessionID string, at time.Time) error {
@@ -88,9 +88,9 @@ func (s *State) RecordGroupInbound(ctx context.Context, sessionID string, at tim
 	return nil
 }
 
-// GroupsLastInbound 一次拿到所有已知群与各自上次互动时间。
+// GroupsLastInbound 一次拿到所有已知群与各自上次活跃时间。
 //
-// HGETALL 把"已知群集合"和"每群最后互动时间"合并成一次 RTT；调度器据此
+// HGETALL 把"已知群集合"和"每群最后活跃时间"合并成一次 RTT；调度器据此
 // 直接挑出最久未活跃的群。解析失败的 field 会被跳过并 warn——单条坏数据
 // 不应该让整轮调度退化为不发送。冷启动时 HASH 不存在则返回空 map（非错误）。
 func (s *State) GroupsLastInbound(ctx context.Context) (map[string]time.Time, error) {

@@ -77,7 +77,7 @@ func (g *Generator) Generate(ctx context.Context, sessionID string, lastInboundA
 		return "", err
 	}
 	messages := []*schema.Message{
-		schema.SystemMessage(g.prompts.System),
+		schema.SystemMessage(buildSystemPrompt(g.prompts)),
 		schema.UserMessage(buildGeneratorPrompt(g.prompts, now, lastInboundAt, history, g.maxHistoryChars)),
 	}
 	reply, err := g.model.Generate(ctx, messages)
@@ -101,6 +101,30 @@ func (g *Generator) loadHistory(ctx context.Context, sessionID string) ([]*schem
 		return nil, fmt.Errorf("proactive: load history: %w", err)
 	}
 	return msgs, nil
+}
+
+// buildSystemPrompt 把规则 system prompt 与 examples 渲染成最终 system 文本。
+//
+// few-shot 这里走"结构化输出风格示例"路线，而不是伪造多轮 user/assistant 消息：
+// 主动消息的真实输入并不是用户自然语言，而是"当前时间+历史摘要+生成任务"，
+// 让配置作者去写 synthetic user 既容易写错，也容易让模型把它误当成真实上下文。
+// 直接列出"输出应该长这样"的 assistant 正例，更贴合本场景，也更容易被模型模仿。
+//
+// examples 为空时直接返回原 system，不附加任何分隔，避免出现尾部空段。
+func buildSystemPrompt(prompts GeneratorPrompts) string {
+	if len(prompts.Examples) == 0 {
+		return prompts.System
+	}
+	var b strings.Builder
+	b.Grow(len(prompts.System) + 64 + len(prompts.Examples)*16)
+	b.WriteString(prompts.System)
+	b.WriteString("\n\n输出风格示例（仅供模仿语气与长度，不要逐字复述）：\n")
+	for _, example := range prompts.Examples {
+		b.WriteString("- ")
+		b.WriteString(example)
+		b.WriteByte('\n')
+	}
+	return b.String()
 }
 
 // buildGeneratorPrompt 组装用户消息。当前只剩群聊一种语境，不再有

@@ -4,11 +4,13 @@
 
 ## 功能
 
-- **被动回复**：用 [eino](https://github.com/cloudwego/eino) `compose.Graph` 把 10 个节点串成一条带分支的回复链路，所有控制流（拦截、降级、收尾副作用）都体现在拓扑而非 if-else 里。
+- **被动回复**：用 [eino](https://github.com/cloudwego/eino) `compose.Graph` 把 11 个节点串成一条带分支的回复链路，所有控制流（拦截、低状态不回复、降级、收尾副作用）都体现在拓扑而非 if-else 里。
 - **两级注入防护**：同步正则黑名单先粗筛；放行后先由独立 LLM 裁判前置判断，安全时才读取上下文并调用主模型。
 - **人设参数 stats**：好感度按 "平台+用户" 维度累计、心情全局共享并按沉默时长自然回归；每轮回复后异步打分写回 Redis。
 - **长期记忆**：按 "平台+用户" 保存压缩事实摘要；回复后异步合并更新，与短期对话历史分离。
-- **主动发消息**（默认关闭）：扫一遍"群最后互动时间"HASH，挑出冷却超过 1h 的群发条短消息；发送成功后写入群历史，时间窗与 Redis 总开关收口在调度器。
+- **群聊触发策略**：普通群文本也会进入 `Bot`，用于记录真实群活跃；`Bot` 只在 @ / 前缀等显式触发，或短时间连续对话窗口内，把消息送进 Agent Graph。
+- **群聊短期上下文**：未触发 Graph 的普通群文本被 `Bot` 写入一条 Redis List（`LPUSH+LTRIM+EXPIRE`，单群最多 20 条 / 10 分钟）；下次 @bot 时由 `loadContext` 直读全量并渲染成 system prompt 里的"刚才群里在聊什么"块，不进个人 history、不污染 stats / memory。
+- **主动发消息**（默认关闭）：扫一遍"群最后活跃时间"HASH，挑出冷却超过 1h 的群发条短消息；发送成功后写入群历史，时间窗与 Redis 总开关收口在调度器。
 - **OpenAI 兼容**：主模型与 judge 都走 OpenAI Chat Completions 协议；DeepSeek、Qwen 兼容模式、OneAPI、Ollama 都能直连。
 
 软降级是通用约定：stats / memory / proactive 失败只打日志，永远不阻断对话主链。
@@ -19,7 +21,7 @@
 flowchart LR
     NapCat[NapCatQQ] -- "反向 WS" --> Adapter
     Adapter -->|InboundMessage| Bot
-    Bot -->|InboundMessage| Graph[Agent Graph]
+    Bot -->|显式触发 / 连续对话| Graph[Agent Graph]
     Bot -.->|旁路| Recorder[ActivityRecorder]
     Graph -->|OutboundMessage| Adapter
     Recorder --> Redis[(Redis)]
@@ -36,7 +38,7 @@ flowchart TD
     regexGate -- blocked --> fallback
     judgeGate -- safe --> loadContext
     judgeGate -- blocked --> fallback
-    loadContext --> buildMessages --> chatModel
+    loadContext --> lowStateGate --> buildMessages --> chatModel
     chatModel --> postproc
     postproc --> saveHistory --> updateMemory --> scoreStats
     fallback --> scoreStats
@@ -48,6 +50,7 @@ flowchart TD
 | `regexGate` | 同步正则黑名单，命中即降级 |
 | `judgeGate` | 前置 LLM 裁判，判攻击即降级；裁判失败时 fail-open |
 | `loadContext` | 拉本轮 prompt 需要的 stats / memory / history 上下文 |
+| `lowStateGate` | 根据低好感度 / 低心情做概率性不回复，最高 50%；命中时直接不发消息，不走兜底话术 |
 | `buildMessages` | 组装 system + history + 当前 user 消息 |
 | `chatModel` | 调用主模型 Generate，写入原始回复 |
 | `postproc` / `saveHistory` / `updateMemory` / `scoreStats` | 清洗回复 → 落历史 → 异步更新长期记忆 → 异步打分 |
@@ -55,7 +58,7 @@ flowchart TD
 
 降级路径绕过 `saveHistory` / `updateMemory` 是 Graph 拓扑的显式结构，不是副作用。
 
-主动消息侧路完全独立：`Bot` 把每条**群**入站消息旁路写入 `proactive.ActivityRecorder`（HSET `bot_proactive_group_last_inbound`）；`Scheduler` 后台轮询 → 扫这份 HASH 选最久未互动且超过 idle 阈值的群 → `Generator` 拉同群最近几条历史作语气参考 → 生成开场白 → 同一个 `Adapter.Send` 发出 → 发完写入一条 assistant-only 群历史并回写 last_inbound 防自激发。
+主动消息侧路完全独立：`Bot` 把每条**群**入站消息（包括未触发 Graph 的普通群文本）旁路写入 `proactive.ActivityRecorder`（HSET `bot_proactive_group_last_inbound`）；`Scheduler` 后台轮询 → 扫这份 HASH 选真实群活跃最久未更新且超过 idle 阈值的群 → `Generator` 拉同群最近几条历史作语气参考 → 生成开场白 → 同一个 `Adapter.Send` 发出 → 发完写入一条 assistant-only 群历史并回写 last_inbound 防自激发。
 
 ### 目录
 
@@ -65,7 +68,7 @@ internal/
 ├── agent/          eino Graph 装配
 │   ├── flow/       Input / State / VerdictKind
 │   ├── guard/      regex / judge / judgeGate
-│   └── nodes/      其余 8 个节点
+│   └── nodes/      其余 9 个节点
 ├── bot/            Adapter→Agent 主循环、并发控制
 ├── config/         YAML + 环境变量
 ├── domain/         平台无关消息模型
@@ -85,8 +88,11 @@ internal/
 | Key | 类型 | 内容 | TTL |
 |-----|------|------|-----|
 | `bot_hist_<sessionID>` | List | 一条 JSON / 元素，`LPUSH` 新消息在头部 | 30d 滑动 |
+| `bot_groupbuf_<sessionID>` | List | 群聊短期上下文，每元素一条 JSON `{uid,un,c,ts}` | `group_buffer.ttl_sec` 滑动（默认 10m） |
 
 `<sessionID>` 形如 `private_123456` 或 `group_789012`。**被动群聊回复会同时再写一份 `bot_hist_private_<userID>`**——这是 "群里搭话也算认识你" 的私聊维度记忆，`loadContext` 时会去重合并回主线。主动群消息只写一条 assistant-only 群历史，不写个人历史。
+
+`bot_groupbuf_*` 仅在群聊会话出现，且只由 `Bot` 在"消息被 follow-up gate 决定不进 Graph"的分支写入，避免与 `bot_hist_*` 重复。`Agent` 侧 `loadContext` 节点对群聊会话直接 `LRANGE 0 -1` 全量读取并渲染——窗口大小由写入侧 `LTRIM 0 max-1` 与 `EXPIRE` 双重管控。
 
 ```bash
 LRANGE bot_hist_private_123456 0 4
@@ -125,16 +131,16 @@ GET bot_memory_onebot_123456
 | Key | 类型 | 内容 | TTL |
 |-----|------|------|-----|
 | `bot_proactive_enabled` | String | `"true"` / `"false"`，运行期总开关 | 永不过期 |
-| `bot_proactive_group_last_inbound` | Hash | field=`group_<id>`，value=最近一次群里和 bot 互动的 Unix 秒 | 永不过期 |
+| `bot_proactive_group_last_inbound` | Hash | field=`group_<id>`，value=最近一次真实群活跃的 Unix 秒 | 永不过期 |
 
-`bot_proactive_group_last_inbound` 同时承担两份语义：HKEYS 即"已知群集合"，HVALS 即"该群上次互动时间"。一份 HASH 是写入面（`ActivityRecorder` 收到群消息时刷新、`Scheduler` 发送成功后回写防自激发）也是读取面（`Scheduler` HGETALL 一次拿到全部决策依据）。冷启动时该 HASH 不存在，调度器自然不发消息；机器人首次被 @ 的群从那一刻起进入候选。
+`bot_proactive_group_last_inbound` 同时承担两份语义：HKEYS 即"已知群集合"，HVALS 即"该群上次真实活跃时间"。一份 HASH 是写入面（`ActivityRecorder` 收到任意群入站消息时刷新、`Scheduler` 发送成功后回写防自激发）也是读取面（`Scheduler` HGETALL 一次拿到全部决策依据）。冷启动时该 HASH 不存在，调度器自然不发消息；机器人首次观察到群消息后，该群从那一刻起进入候选。
 
 运行期管理无内置命令，直接 `redis-cli`：
 
 ```bash
 SET     bot_proactive_enabled true                  # 打开
 DEL     bot_proactive_enabled                       # 关闭
-HGETALL bot_proactive_group_last_inbound            # 看当前已知群与最后互动时间
+HGETALL bot_proactive_group_last_inbound            # 看当前已知群与最后活跃时间
 HDEL    bot_proactive_group_last_inbound group_789  # 把某个群从候选中清除
 ```
 

@@ -68,6 +68,16 @@ func main() {
 	defer func() { _ = redisCli.Close() }()
 	historyRepo := store.NewHistoryRepo(redisCli)
 
+	// 群聊短期上下文缓存：仅用于 @bot 时回溯刚才群里在聊什么。
+	// Enabled=false 时为 nil，Bot / Agent 内部都按"功能关闭"处理。
+	var groupBuffer store.GroupBufferRepo
+	if cfg.GroupBuffer.Enabled {
+		groupBuffer = store.NewGroupBufferRepo(redisCli, cfg.GroupBuffer.MaxMessages, cfg.GroupBuffer.TTL())
+		logger.Info("group buffer enabled",
+			slog.Int("max_messages", cfg.GroupBuffer.MaxMessages),
+			slog.Int("ttl_sec", cfg.GroupBuffer.TTLSec))
+	}
+
 	// 步骤 4：加载人设模板。
 	persona, err := agent.LoadPersona(cfg.Agent.PromptFile)
 	if err != nil {
@@ -120,6 +130,7 @@ func main() {
 		Logger:       logger,
 		Stats:        statsStore,
 		Memory:       memoryStore,
+		GroupBuffer:  groupBuffer,
 		JudgePrompt:  judgePrompt,
 		ScoreModel:   scoreModel,
 		ScorePrompt:  scorePrompt,
@@ -150,7 +161,7 @@ func main() {
 	// 步骤 10：启动主动调度并跑主循环。
 	// 主动调度与主循环共享同一个 ctx：进程收到退出信号时两条链路一起停。
 	go proactiveScheduler.Run(ctx)
-	b := bot.New(ad, runnable, activityRecorder, logger)
+	b := bot.New(ad, runnable, activityRecorder, groupBuffer, logger, cfg.Trigger)
 	b.Run(ctx) // 阻塞直到 ctx 被取消
 
 	// 步骤 11：优雅关闭。
