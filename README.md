@@ -130,10 +130,10 @@ GET bot_memory_onebot_123456
 运行期管理无内置命令，直接 `redis-cli`：
 
 ```bash
-SET   bot_proactive_enabled true                  # 打开
-DEL   bot_proactive_enabled                       # 关闭
-HGETALL bot_proactive_group_last_inbound          # 看当前已知群与最后互动时间
-HDEL  bot_proactive_group_last_inbound group_789  # 把某个群从候选中清除
+SET     bot_proactive_enabled true                  # 打开
+DEL     bot_proactive_enabled                       # 关闭
+HGETALL bot_proactive_group_last_inbound            # 看当前已知群与最后互动时间
+HDEL    bot_proactive_group_last_inbound group_789  # 把某个群从候选中清除
 ```
 
 ## 运行
