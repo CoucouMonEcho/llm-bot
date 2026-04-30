@@ -1,7 +1,7 @@
 // Package nodes 的 load_context.go 实现"读取本轮对话上下文"的复合节点。
 //
 // 位置：judgeGate(放行) → loadContext → lowStateGate。
-// 内部顺序固定为 stats snapshot → memory load → history load → group background；
+// 内部顺序固定为 stats snapshot → memory load → persona topics → history load → group background；
 // 这些上下文都是 prompt 装饰信号，读取失败时降级为缺省值，不阻断主聊天链路。
 package nodes
 
@@ -16,6 +16,7 @@ import (
 	"github.com/cloudwego/eino/schema"
 	"github.com/echo/llm-bot/internal/agent/flow"
 	"github.com/echo/llm-bot/internal/memory"
+	"github.com/echo/llm-bot/internal/persona"
 	"github.com/echo/llm-bot/internal/stats"
 	"github.com/echo/llm-bot/internal/store"
 )
@@ -33,15 +34,18 @@ const groupBackgroundMaxChars = 1200
 func NewLoadContext(
 	statsStore *stats.Store,
 	memoryStore *memory.Store,
+	topicStore *persona.Store,
 	historyRepo store.HistoryRepo,
 	groupBuffer store.GroupBufferRepo,
-	memoryMaxChars, historySize int,
+	memoryMaxChars, historySize, topicMaxItems int,
+	topicMaxAge time.Duration,
 	logger *slog.Logger,
 ) *compose.Lambda {
 	lg := cmp.Or(logger, slog.Default()).With(slog.String("node", "loadContext"))
 	return compose.InvokableLambda(func(ctx context.Context, st *flow.State) (*flow.State, error) {
 		loadStatsSnapshot(ctx, st, statsStore)
 		loadUserMemory(ctx, st, memoryStore, memoryMaxChars, lg)
+		loadPersonaTopics(ctx, st, topicStore, topicMaxItems, topicMaxAge, lg)
 		loadSessionHistory(ctx, st, historyRepo, historySize, lg)
 		loadGroupBackground(ctx, st, groupBuffer, lg)
 		return st, nil
@@ -65,6 +69,19 @@ func loadUserMemory(ctx context.Context, st *flow.State, store *memory.Store, ma
 	if st.Memory != "" {
 		lg.Debug("memory loaded", slog.String("session", st.In.SessionID))
 	}
+}
+
+func loadPersonaTopics(ctx context.Context, st *flow.State, store *persona.Store, maxItems int, maxAge time.Duration, lg *slog.Logger) {
+	if store == nil || st == nil {
+		return
+	}
+	topics, err := store.Load(ctx, maxItems, maxAge)
+	if err != nil {
+		lg.Warn("load persona topics failed, fallback to empty", slog.Any("err", err))
+		st.CasualTopics = nil
+		return
+	}
+	st.CasualTopics = topics
 }
 
 func loadSessionHistory(ctx context.Context, st *flow.State, repo store.HistoryRepo, historySize int, lg *slog.Logger) {

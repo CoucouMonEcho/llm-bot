@@ -10,8 +10,7 @@
 //
 // 设计思考：
 //   - 同一条对话的 user 消息与 assistant 消息都会追加进来，以保持顺序；
-//   - 攻击消息与降级回复不会调用 Append（这一点在 agent 层控制，store 层
-//     不感知业务语义）。
+//   - 攻击消息会在 agent 层静默中断，不会调用 Append；store 层不感知业务语义。
 package store
 
 import (

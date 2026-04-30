@@ -1,13 +1,11 @@
 // Package nodes 的 score_stats.go 实现"回复生成后触发 stats 打分"的 Lambda 节点。
 //
-// 位置：
-//   - 正常路径：saveHistory → scoreStats → END
-//   - 降级路径：fallback → scoreStats → END
+// 位置：updatePersonaTopics → scoreStats → END。
 //
 // 本节点只触发异步 Dispatch，不等待打分模型与 Redis 写入完成。触发点是
 // "Agent 已经生成回复"，而不是 Adapter 发送成功：stats 描述的是这轮对话
-// 对人设参数的影响，不应被平台发送成功与否绑住。降级路径也会到这里，
-// 因为攻击/调戏本身同样会影响好感度与心情。
+// 对人设参数的影响，不应被平台发送成功与否绑住。攻击消息会在前置 guard
+// 静默中断，不会走到这里。
 package nodes
 
 import (

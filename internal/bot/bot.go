@@ -7,6 +7,7 @@ package bot
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"strings"
 	"sync"
@@ -50,9 +51,10 @@ type Bot struct {
 	// 不进 Graph 的群聊普通消息上做 Append（详见 cacheGroupBackground）。
 	groupBuffer store.GroupBufferRepo
 
-	followupWindow time.Duration
-	followups      map[followupKey]time.Time
-	followupsMu    sync.Mutex
+	followupWindow          time.Duration
+	followups               map[followupKey]time.Time
+	proactiveGroupFollowups map[string]time.Time
+	followupsMu             sync.Mutex
 
 	now func() time.Time
 	sem chan struct{} // 并发信号量
@@ -79,15 +81,16 @@ func New(ad adapter.Adapter, rn agent.Runnable, recorder *proactive.ActivityReco
 		followupWindow = 0
 	}
 	return &Bot{
-		adapter:          ad,
-		runnable:         rn,
-		logger:           logger.With(slog.String("component", "bot")),
-		activityRecorder: recorder,
-		groupBuffer:      groupBuffer,
-		followupWindow:   followupWindow,
-		followups:        make(map[followupKey]time.Time),
-		now:              time.Now,
-		sem:              make(chan struct{}, maxConcurrent),
+		adapter:                 ad,
+		runnable:                rn,
+		logger:                  logger.With(slog.String("component", "bot")),
+		activityRecorder:        recorder,
+		groupBuffer:             groupBuffer,
+		followupWindow:          followupWindow,
+		followups:               make(map[followupKey]time.Time),
+		proactiveGroupFollowups: make(map[string]time.Time),
+		now:                     time.Now,
+		sem:                     make(chan struct{}, maxConcurrent),
 	}
 }
 
@@ -171,6 +174,10 @@ func (b *Bot) handle(parent context.Context, m *domain.InboundMessage) {
 	// 步骤 2：驱动 Graph。
 	state, err := b.runnable.Invoke(ctx, in)
 	if err != nil {
+		if errors.Is(err, flow.ErrSkipReply) {
+			lg.Debug("agent skipped reply")
+			return
+		}
 		lg.Error("agent invoke failed", slog.Any("err", err))
 		return
 	}
@@ -219,6 +226,22 @@ func (b *Bot) currentTime() time.Time {
 	return time.Now()
 }
 
+// OpenProactiveFollowup 打开"主动群发后的首个回应"窗口。
+//
+// 主动消息没有目标用户，因此这里按群会话记录一个一次性窗口；真正被某个
+// 用户的普通消息消费后，若回复发送成功，refreshFollowup 会把后续窗口续到
+// 这个用户身上。
+func (b *Bot) OpenProactiveFollowup(sessionID string, sentAt time.Time) {
+	if b == nil || b.followupWindow <= 0 || sessionID == "" {
+		return
+	}
+
+	b.followupsMu.Lock()
+	defer b.followupsMu.Unlock()
+	b.pruneExpiredFollowupsLocked(sentAt)
+	b.proactiveGroupFollowups[sessionID] = sentAt.Add(b.followupWindow)
+}
+
 func (b *Bot) shouldInvokeGraph(m *domain.InboundMessage, now time.Time) bool {
 	if m.ConvType != domain.ConversationGroup {
 		return true
@@ -233,6 +256,10 @@ func (b *Bot) shouldInvokeGraph(m *domain.InboundMessage, now time.Time) bool {
 	key := followupKey{sessionID: m.SessionID, userID: m.UserID}
 	b.followupsMu.Lock()
 	defer b.followupsMu.Unlock()
+
+	if b.consumeProactiveFollowupLocked(m.SessionID, now) {
+		return true
+	}
 
 	expiresAt, ok := b.followups[key]
 	if !ok {
@@ -285,12 +312,30 @@ func (b *Bot) refreshFollowup(m *domain.InboundMessage, now time.Time) {
 	b.followupsMu.Lock()
 	defer b.followupsMu.Unlock()
 
+	b.pruneExpiredFollowupsLocked(now)
+	b.followups[key] = now.Add(b.followupWindow)
+}
+
+func (b *Bot) consumeProactiveFollowupLocked(sessionID string, now time.Time) bool {
+	expiresAt, ok := b.proactiveGroupFollowups[sessionID]
+	if !ok {
+		return false
+	}
+	delete(b.proactiveGroupFollowups, sessionID)
+	return now.Before(expiresAt)
+}
+
+func (b *Bot) pruneExpiredFollowupsLocked(now time.Time) {
 	for k, expiresAt := range b.followups {
 		if !now.Before(expiresAt) {
 			delete(b.followups, k)
 		}
 	}
-	b.followups[key] = now.Add(b.followupWindow)
+	for sessionID, expiresAt := range b.proactiveGroupFollowups {
+		if !now.Before(expiresAt) {
+			delete(b.proactiveGroupFollowups, sessionID)
+		}
+	}
 }
 
 // targetReplyLatency 是从收到消息到发出回复的目标总耗时。
@@ -344,7 +389,6 @@ func waitBeforeSend(ctx context.Context, receivedAt time.Time, targetTotal time.
 // 全局 config / Bot 结构上，是因为"样式"天然属于消息级语境——
 //   - "主动发消息、不艾特任何人"       → 返回 nil；
 //   - "短句不打扰、中句 @、长句引用"    → 根据回复文本量分支；
-//   - "被攻击的降级回复不引用原消息"   → 未来可再传入 *flow.State 判断。
 //
 // 任何新增策略都应当只改本函数的实现，避免把开关在全局配置里四处蔓延。
 //

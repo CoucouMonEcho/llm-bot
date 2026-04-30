@@ -85,12 +85,12 @@ type State struct {
 	// 直接交给 chatModel 节点作为 Generate 的入参。
 	Messages []*schema.Message
 
-	// Reply 是 LLM 的最终回复（可能为降级回复）。
-	// 主链正常返回或 fallback 节点生成后填充。
+	// Reply 是 LLM 的最终回复。
+	// 主链正常返回后填充；静默不回复路径会在填充前中断 Graph。
 	Reply *schema.Message
 
 	// VerdictKind 是本轮防护判定的种类。
-	// 零值即 VerdictSafe，表示一路放行；非零意味着 Graph 应路由到 fallback。
+	// 零值即 VerdictSafe，表示一路放行；非零意味着 Graph 已在防护节点静默拦截。
 	VerdictKind VerdictKind
 
 	// Affinity / Mood 是本轮对话开始时 stats 快照的平铺字段。
@@ -107,6 +107,10 @@ type State struct {
 	// 它按"平台 + 用户"维度存储，和会话历史分离：history 负责最近发生的逐条对话，
 	// Memory 负责跨会话保留高度压缩的偏好、近况与雷区。为空表示无可用记忆。
 	Memory string
+
+	// CasualTopics 是本轮对话开始时读取到的全局闲聊话题锚点。
+	// 它只保存短、可复用的话题文本，不保存用户画像或长期事实；读取失败或功能关闭时为空。
+	CasualTopics []string
 
 	// GroupBackground 是 loadContext 节点根据短期群聊缓存渲染好的"刚才群里在聊什么"的背景文本。
 	// 仅当 In.ConvType == "group" 且仓库返回非空时填充；私聊或缓存关闭/读失败时保持空串，

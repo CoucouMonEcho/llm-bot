@@ -71,6 +71,8 @@ type Options struct {
 	HistoryMax int
 	Logger     *slog.Logger
 	Config     Config
+
+	OnSendSuccess func(sessionID string, sentAt time.Time)
 }
 
 // Scheduler 运行单进程的主动消息调度循环。
@@ -87,6 +89,8 @@ type Scheduler struct {
 	cfg        Config
 	now        func() time.Time
 	rng        *rand.Rand
+
+	onSendSuccess func(sessionID string, sentAt time.Time)
 }
 
 // NewScheduler 构造调度器；这里不做分布式锁，调用方需保证只启动一个实例。
@@ -96,15 +100,16 @@ func NewScheduler(opts Options) *Scheduler {
 		cfg.Interval = 10 * time.Minute
 	}
 	return &Scheduler{
-		state:      opts.State,
-		generator:  opts.Generator,
-		sender:     opts.Sender,
-		history:    opts.History,
-		historyMax: opts.HistoryMax,
-		log:        cmp.Or(opts.Logger, slog.Default()),
-		cfg:        cfg,
-		now:        time.Now,
-		rng:        rand.New(rand.NewSource(time.Now().UnixNano())),
+		state:         opts.State,
+		generator:     opts.Generator,
+		sender:        opts.Sender,
+		history:       opts.History,
+		historyMax:    opts.HistoryMax,
+		log:           cmp.Or(opts.Logger, slog.Default()),
+		cfg:           cfg,
+		now:           time.Now,
+		rng:           rand.New(rand.NewSource(time.Now().UnixNano())),
+		onSendSuccess: opts.OnSendSuccess,
 	}
 }
 
@@ -190,6 +195,10 @@ func (s *Scheduler) RunOnce(ctx context.Context) error {
 	}); err != nil {
 		return fmt.Errorf("proactive: send: %w", err)
 	}
+	sentAt := s.now()
+	if s.onSendSuccess != nil {
+		s.onSendSuccess(sessionID, sentAt)
+	}
 
 	if s.history != nil {
 		if err := s.history.Append(ctx, sessionID, schema.AssistantMessage(text, nil), s.historyMax); err != nil {
@@ -200,13 +209,13 @@ func (s *Scheduler) RunOnce(ctx context.Context) error {
 	}
 
 	// 防自激发：发完即视作"群里和 bot 又互动了一次"，等同一条群消息进来。
-	if err := s.state.RecordGroupInbound(ctx, sessionID, now); err != nil {
+	if err := s.state.RecordGroupInbound(ctx, sessionID, sentAt); err != nil {
 		return err
 	}
 
 	s.log.Info("proactive message sent",
 		"session", sessionID,
-		"idle", now.Sub(lastAt))
+		"idle", sentAt.Sub(lastAt))
 	return nil
 }
 

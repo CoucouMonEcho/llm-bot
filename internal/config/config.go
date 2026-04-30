@@ -21,19 +21,20 @@ import (
 
 // Config 是整个应用的配置根对象，字段与 configs/config.yaml 一一对应。
 type Config struct {
-	Server      Server      `yaml:"server"`
-	Redis       Redis       `yaml:"redis"`
-	LLM         LLM         `yaml:"llm"`
-	Judge       LLM         `yaml:"judge"`
-	Agent       Agent       `yaml:"agent"`
-	Guard       Guard       `yaml:"guard"`
-	Trigger     Trigger     `yaml:"trigger"`
-	GroupBuffer GroupBuffer `yaml:"group_buffer"`
-	Blacklist   Blacklist   `yaml:"blacklist"`
-	Log         Log         `yaml:"log"`
-	Stats       Stats       `yaml:"stats"`
-	Memory      Memory      `yaml:"memory"`
-	Proactive   Proactive   `yaml:"proactive"`
+	Server        Server        `yaml:"server"`
+	Redis         Redis         `yaml:"redis"`
+	LLM           LLM           `yaml:"llm"`
+	Judge         LLM           `yaml:"judge"`
+	Agent         Agent         `yaml:"agent"`
+	Guard         Guard         `yaml:"guard"`
+	Trigger       Trigger       `yaml:"trigger"`
+	GroupBuffer   GroupBuffer   `yaml:"group_buffer"`
+	Blacklist     Blacklist     `yaml:"blacklist"`
+	Log           Log           `yaml:"log"`
+	Stats         Stats         `yaml:"stats"`
+	Memory        Memory        `yaml:"memory"`
+	PersonaTopics PersonaTopics `yaml:"persona_topics"`
+	Proactive     Proactive     `yaml:"proactive"`
 }
 
 // Blacklist 控制需要在 Adapter 源头忽略的账号。
@@ -67,6 +68,29 @@ type Memory struct {
 	UpdatePromptFile string `yaml:"update_prompt_file"`
 	// MaxChars 限制注入和保存的长期记忆最大字符数。
 	MaxChars int `yaml:"max_chars"`
+}
+
+// PersonaTopics 控制全局闲聊话题锚点。
+//
+// Enabled=false 时，agent 不读写话题锚点，系统提示词也不会出现话题块。
+// Enabled=true 时复用 cfg.Judge 的 LLM 在正常回复后异步整理少量短话题；
+// Redis 中使用一个全局 ZSET 保存 topic -> last_update_unix。
+type PersonaTopics struct {
+	Enabled bool `yaml:"enabled"`
+	// MaxItems 限制注入和保存的最大话题数量。
+	MaxItems int `yaml:"max_items"`
+	// MaxAgeHours 限制话题最长存活时间，过期成员由 ZREMRANGEBYSCORE 清理。
+	MaxAgeHours int `yaml:"max_age_hours"`
+	// UpdatePromptFile 是话题更新模型 system prompt 的 YAML 文件路径。
+	UpdatePromptFile string `yaml:"update_prompt_file"`
+}
+
+// MaxAge 把 MaxAgeHours 暴露成 time.Duration。
+func (p PersonaTopics) MaxAge() time.Duration {
+	if p.MaxAgeHours <= 0 {
+		return 0
+	}
+	return time.Duration(p.MaxAgeHours) * time.Hour
 }
 
 // Proactive 控制主动发消息的静态策略。YAML 只保存部署期参数；
@@ -161,13 +185,11 @@ type Agent struct {
 	EmptyReplyFallback string `yaml:"empty_reply_fallback"`
 }
 
-// Guard 描述固定启用的 LLM 裁判与降级回复参数。
+// Guard 描述固定启用的 LLM 裁判参数；裁判未明确输出 safe 时静默不回复。
 type Guard struct {
 	// JudgePromptFile 是 LLM 裁判 system prompt 的 YAML 文件路径。
 	// 裁判固定作为输入侧安全判定：只有明确输出 safe 才进入主链。
 	JudgePromptFile string `yaml:"judge_prompt_file"`
-	// FallbackReplies 是降级回复的候选池，运行时随机挑选一条。
-	FallbackReplies []string `yaml:"fallback_replies"`
 }
 
 // Trigger 控制哪些消息会被 Adapter 投递给下游。
@@ -227,9 +249,10 @@ func Load(path string) (*Config, error) {
 	}
 
 	cfg := Config{
-		Proactive:   defaultProactive(),
-		Memory:      defaultMemory(),
-		GroupBuffer: defaultGroupBuffer(),
+		Proactive:     defaultProactive(),
+		Memory:        defaultMemory(),
+		PersonaTopics: defaultPersonaTopics(),
+		GroupBuffer:   defaultGroupBuffer(),
 	}
 	if err := yaml.Unmarshal(raw, &cfg); err != nil {
 		return nil, fmt.Errorf("config: unmarshal %s: %w", path, err)
@@ -295,6 +318,7 @@ func (c *Config) validate() error {
 	if c.Memory.MaxChars <= 0 {
 		c.Memory.MaxChars = defaultMemory().MaxChars
 	}
+	c.normalizePersonaTopics()
 	if c.Agent.PromptFile == "" {
 		return fmt.Errorf("config: agent.prompt_file is required")
 	}
@@ -304,9 +328,6 @@ func (c *Config) validate() error {
 	c.Agent.EmptyReplyFallback = strings.TrimSpace(c.Agent.EmptyReplyFallback)
 	if c.Agent.EmptyReplyFallback == "" {
 		c.Agent.EmptyReplyFallback = "我去洗澡了"
-	}
-	if len(c.Guard.FallbackReplies) == 0 {
-		return fmt.Errorf("config: guard.fallback_replies must contain at least one entry")
 	}
 	c.normalizeBlacklist()
 	c.normalizeGroupBuffer()
@@ -349,7 +370,7 @@ func (c *Config) normalizeBlacklist() {
 
 func defaultProactive() Proactive {
 	return Proactive{
-		PromptFile:       "configs/prompts/proactive.yaml",
+		PromptFile:       "configs/prompts/persona.yaml",
 		WindowStart:      "10:00",
 		WindowEnd:        "01:00",
 		IntervalSec:      int((10 * time.Minute) / time.Second),
@@ -363,6 +384,29 @@ func defaultMemory() Memory {
 		Enabled:          false,
 		UpdatePromptFile: "configs/prompts/memory_update.yaml",
 		MaxChars:         1200,
+	}
+}
+
+func defaultPersonaTopics() PersonaTopics {
+	return PersonaTopics{
+		Enabled:          true,
+		MaxItems:         5,
+		MaxAgeHours:      12,
+		UpdatePromptFile: "configs/prompts/persona_topics_update.yaml",
+	}
+}
+
+func (c *Config) normalizePersonaTopics() {
+	defaults := defaultPersonaTopics()
+	if c.PersonaTopics.MaxItems <= 0 {
+		c.PersonaTopics.MaxItems = defaults.MaxItems
+	}
+	if c.PersonaTopics.MaxAgeHours <= 0 {
+		c.PersonaTopics.MaxAgeHours = defaults.MaxAgeHours
+	}
+	c.PersonaTopics.UpdatePromptFile = strings.TrimSpace(c.PersonaTopics.UpdatePromptFile)
+	if c.PersonaTopics.UpdatePromptFile == "" {
+		c.PersonaTopics.UpdatePromptFile = defaults.UpdatePromptFile
 	}
 }
 

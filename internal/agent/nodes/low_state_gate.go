@@ -6,7 +6,6 @@ package nodes
 
 import (
 	"context"
-	"errors"
 	"math"
 	"math/rand/v2"
 
@@ -23,8 +22,6 @@ const (
 	moodSkipThreshold = -20
 	moodSkipFloor     = -50
 )
-
-var errLowStateSkipReply = errors.New("agent: low state skip reply")
 
 // NewLowStateGate 构造 lowStateGate 节点。
 //
@@ -48,7 +45,7 @@ func lowStateGate(st *flow.State, randFn func() float64) (*flow.State, error) {
 		return st, nil
 	}
 	if randFn() < probability {
-		return nil, errLowStateSkipReply
+		return nil, flow.ErrSkipReply
 	}
 	return st, nil
 }

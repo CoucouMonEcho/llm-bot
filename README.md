@@ -4,8 +4,8 @@
 
 ## 功能
 
-- **被动回复**：用 [eino](https://github.com/cloudwego/eino) `compose.Graph` 把 10 个节点串成一条带分支的回复链路，所有控制流（拦截、低状态不回复、降级、收尾副作用）都体现在拓扑而非 if-else 里。
-- **前置注入裁判**：独立 LLM 裁判先判断输入，只有明确输出 `safe` 才读取上下文并调用主模型；裁判错误或非预期输出都会走降级路径。
+- **被动回复**：用 [eino](https://github.com/cloudwego/eino) `compose.Graph` 把 10 个节点串成一条回复链路，拦截、低状态不回复和收尾副作用都收在节点边界里。
+- **前置注入裁判**：独立 LLM 裁判先判断输入，只有明确输出 `safe` 才读取上下文并调用主模型；非安全输入会静默不回复。
 - **人设参数 stats**：好感度按 "平台+用户" 维度累计、心情全局共享并按沉默时长自然回归；每轮回复后异步打分写回 Redis。
 - **长期记忆**：按 "平台+用户" 保存压缩事实摘要；回复后异步合并更新，与短期对话历史分离。
 - **群聊触发策略**：普通群文本也会进入 `Bot`，用于记录真实群活跃；`Bot` 只在 @ / 前缀等显式触发，或短时间连续对话窗口内，把消息送进 Agent Graph。
@@ -35,25 +35,28 @@ flowchart LR
 flowchart TD
     START([START]) --> judgeGate
     judgeGate -- safe --> loadContext
-    judgeGate -- "non-safe" --> fallback
-    loadContext --> lowStateGate --> buildMessages --> chatModel
+    judgeGate -- "non-safe" --> skipReply
+    loadContext --> lowStateGate
+    lowStateGate -- reply --> buildMessages
+    lowStateGate -- skip --> skipReply
+    buildMessages --> chatModel
     chatModel --> postproc
-    postproc --> saveHistory --> updateMemory --> scoreStats
-    fallback --> scoreStats
+    postproc --> saveHistory --> updateMemory --> updatePersonaTopics --> scoreStats
     scoreStats --> END([END])
+    skipReply[skipReply] --> END
 ```
 
 | 节点 | 作用 |
 |------|------|
-| `judgeGate` | 前置 LLM 裁判；只有明确输出 `safe` 才放行，裁判失败或非预期输出都降级 |
+| `judgeGate` | 前置 LLM 裁判；只有明确输出 `safe` 才放行，非安全输入静默不回复 |
 | `loadContext` | 拉本轮 prompt 需要的 stats / memory / history 上下文 |
 | `lowStateGate` | 根据低好感度 / 低心情做概率性不回复，最高 50%；命中时直接不发消息，不走兜底话术 |
 | `buildMessages` | 组装 system + history + 当前 user 消息 |
 | `chatModel` | 调用主模型 Generate，写入原始回复 |
-| `postproc` / `saveHistory` / `updateMemory` / `scoreStats` | 清洗回复 → 落历史 → 异步更新长期记忆 → 异步打分 |
-| `fallback` | 从配置池随机选一条降级回复；攻击消息**不入历史**，但仍触发打分 |
+| `postproc` / `saveHistory` / `updateMemory` / `updatePersonaTopics` / `scoreStats` | 清洗回复 → 落历史 → 异步更新长期记忆 → 异步更新话题锚点 → 异步打分 |
+| `skipReply` | 静默结束：不发消息、不入 history、不触发回复后副作用 |
 
-降级路径绕过 `saveHistory` / `updateMemory` 是 Graph 拓扑的显式结构，不是副作用。
+静默中断路径由节点返回 `ErrSkipReply` 触发；Graph 中断后不会进入 `saveHistory` / `updateMemory` / `updatePersonaTopics` / `scoreStats`。
 
 主动消息侧路完全独立：`Bot` 把每条**群**入站消息（包括未触发 Graph 的普通群文本）旁路写入 `proactive.ActivityRecorder`（HSET `bot_proactive_group_last_inbound`）；`Scheduler` 后台轮询 → 扫这份 HASH 选真实群活跃最久未更新且超过 idle 阈值的群 → `Generator` 拉同群最近几条历史作语气参考 → 生成开场白 → 同一个 `Adapter.Send` 发出 → 发完写入一条 assistant-only 群历史并回写 last_inbound 防自激发。
 

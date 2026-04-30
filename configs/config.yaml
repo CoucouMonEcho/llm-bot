@@ -32,18 +32,13 @@ judge:
 # Agent 业务参数
 agent:
   history_size: 100                               # 单会话保留的最近历史条数
-  prompt_file:  "configs/prompts/default.yaml"    # 人设 YAML 文件路径
+  prompt_file:  "configs/prompts/persona.yaml"    # 人设 YAML 文件路径
   empty_reply_fallback: "我去洗澡了"               # 主链清洗后为空时的兜底回复
 
-# 提示词注入防护：前置 LLM 裁判固定启用，只有明确输出 safe 才进入主链
+# 提示词注入防护：前置 LLM 裁判固定启用，只有明确输出 safe 才进入主链。
 guard:
-  # 裁判输出非 safe（含 attack、未知输出、请求失败）都会走降级回复。
+  # 裁判输出非 safe（含 attack、未知输出、请求失败）都会静默不回复。
   judge_prompt_file: "configs/prompts/judge.yaml"
-
-  # 裁判未明确放行时的降级回复模板，运行时随机挑选一条，避免被攻击者识别固定模式。
-  fallback_replies:
-    - "达咩哟 达咩"
-    - "听不懂喵"
 
 # 触发规则：Adapter 标记显式触发，并保留群聊普通文本供后续跟进判断。
 trigger:
@@ -83,11 +78,19 @@ memory:
   update_prompt_file: "configs/prompts/memory_update.yaml"
   max_chars: 1200
 
+# 人设闲聊话题锚点：全局保存少量最近可延续的话题，避免每轮都像重新认识上下文。
+# Redis 使用 ZSET bot_persona_casual_topics，score 是最后更新时间戳。
+persona_topics:
+  enabled: true
+  max_items: 5
+  max_age_hours: 12
+  update_prompt_file: "configs/prompts/persona_topics_update.yaml"
+
 # 主动发消息（静态策略）：运行期开关保存在 Redis。
 # YAML 段只配置部署期参数；要启用主动发送，需要在 Redis 中显式
 # `SET bot_proactive_enabled true`，默认 unset 等价于关闭。
 proactive:
-  prompt_file: "configs/prompts/proactive.yaml"
+  prompt_file: "configs/prompts/persona.yaml"
   window_start: "10:00"
   window_end: "01:00"
   interval_sec: 600         # 每轮等待 10 分钟

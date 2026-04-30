@@ -2,8 +2,7 @@
 //
 // 位置：START → judgeGate → loadContext。
 // judgeGate 负责把 flow.Input 装箱成 flow.State，并做输入侧安全判定；只有
-// 裁判明确输出 safe 时才放行，其它情况写入 flow.VerdictJudge，由 Graph branch
-// 路由到 fallback。
+// 裁判明确输出 safe 时才放行，其它情况直接返回 flow.ErrSkipReply，由 Bot 静默不回复。
 package guard
 
 import (
@@ -33,7 +32,7 @@ func NewJudgeGate(judge *Judge, logger *slog.Logger) *compose.Lambda {
 		if judge == nil {
 			st.VerdictKind = flow.VerdictJudge
 			lg.Warn("judge missing, fail-closed", slog.String("session", session))
-			return st, nil
+			return nil, flow.ErrSkipReply
 		}
 
 		safe, err := judge.Classify(ctx, query)
@@ -42,11 +41,12 @@ func NewJudgeGate(judge *Judge, logger *slog.Logger) *compose.Lambda {
 			lg.Warn("judge error, fail-closed",
 				slog.String("session", session),
 				slog.Any("err", err))
-			return st, nil
+			return nil, flow.ErrSkipReply
 		}
 		if !safe {
 			st.VerdictKind = flow.VerdictJudge
 			lg.Info("judge blocked", slog.String("session", session))
+			return nil, flow.ErrSkipReply
 		}
 		return st, nil
 	})
