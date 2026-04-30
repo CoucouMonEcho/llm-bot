@@ -227,7 +227,7 @@ func buildProactiveScheduler(ctx context.Context, cfg *config.Config, state *pro
 		WindowEnd:       cfg.Proactive.WindowEnd,
 		Interval:        cfg.Proactive.Interval(),
 		Jitter:          cfg.Proactive.JitterMax(),
-		IdleThreshold:   cfg.Proactive.IdleThreshold(),
+		BotSilence:      cfg.Proactive.BotSilenceThreshold(),
 		HistorySize:     6,
 		MaxHistoryChars: 1200,
 	}

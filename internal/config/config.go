@@ -90,8 +90,8 @@ type Proactive struct {
 	IntervalSec int `yaml:"interval_sec"`
 	// JitterMaxSec 是每轮调度额外随机等待的上限，用来打散固定整点发送痕迹。
 	JitterMaxSec int `yaml:"jitter_max_sec"`
-	// IdleThresholdSec 是 bot 在群里沉默多久才主动开口的阈值。
-	IdleThresholdSec int `yaml:"idle_threshold_sec"`
+	// BotSilenceThresholdSec 是 bot 在群里沉默多久才主动开口的阈值。
+	BotSilenceThresholdSec int `yaml:"bot_silence_threshold_sec"`
 }
 
 // Interval 返回主动调度的基础间隔。
@@ -104,9 +104,9 @@ func (p Proactive) JitterMax() time.Duration {
 	return seconds(p.JitterMaxSec)
 }
 
-// IdleThreshold 返回群冷却阈值。
-func (p Proactive) IdleThreshold() time.Duration {
-	return seconds(p.IdleThresholdSec)
+// BotSilenceThreshold 返回 bot 群内沉默阈值。
+func (p Proactive) BotSilenceThreshold() time.Duration {
+	return seconds(p.BotSilenceThresholdSec)
 }
 
 // Server 描述对外提供的 HTTP / WebSocket 服务。
@@ -157,8 +157,6 @@ type Agent struct {
 	HistorySize int `yaml:"history_size"`
 	// PromptFile 是人设 Markdown 文件的路径（相对工作目录）。
 	PromptFile string `yaml:"prompt_file"`
-	// EmptyReplyFallback 是主链回复清洗后为空时发送的兜底文案。
-	EmptyReplyFallback string `yaml:"empty_reply_fallback"`
 }
 
 // Guard 描述固定启用的 LLM 裁判参数；裁判未明确输出 safe 时静默不回复。
@@ -299,10 +297,6 @@ func (c *Config) validate() error {
 	if c.Agent.HistorySize <= 0 {
 		c.Agent.HistorySize = 20
 	}
-	c.Agent.EmptyReplyFallback = strings.TrimSpace(c.Agent.EmptyReplyFallback)
-	if c.Agent.EmptyReplyFallback == "" {
-		c.Agent.EmptyReplyFallback = "我去洗澡了"
-	}
 	c.normalizeBlacklist()
 	c.normalizeGroupBuffer()
 	if err := c.validateProactive(); err != nil {
@@ -344,12 +338,12 @@ func (c *Config) normalizeBlacklist() {
 
 func defaultProactive() Proactive {
 	return Proactive{
-		PromptFile:       "configs/prompts/persona/generator.md",
-		WindowStart:      "10:00",
-		WindowEnd:        "01:00",
-		IntervalSec:      int((10 * time.Minute) / time.Second),
-		JitterMaxSec:     int((1 * time.Minute) / time.Second),
-		IdleThresholdSec: int((1 * time.Hour) / time.Second),
+		PromptFile:             "configs/prompts/persona/generator.md",
+		WindowStart:            "10:00",
+		WindowEnd:              "01:00",
+		IntervalSec:            int((10 * time.Minute) / time.Second),
+		JitterMaxSec:           int((1 * time.Minute) / time.Second),
+		BotSilenceThresholdSec: int((1 * time.Hour) / time.Second),
 	}
 }
 
@@ -390,8 +384,8 @@ func (c *Config) validateProactive() error {
 	if c.Proactive.JitterMaxSec < 0 {
 		return fmt.Errorf("config: proactive.jitter_max_sec must be >= 0")
 	}
-	if c.Proactive.IdleThresholdSec <= 0 {
-		c.Proactive.IdleThresholdSec = defaults.IdleThresholdSec
+	if c.Proactive.BotSilenceThresholdSec <= 0 {
+		c.Proactive.BotSilenceThresholdSec = defaults.BotSilenceThresholdSec
 	}
 
 	if _, err := time.Parse("15:04", c.Proactive.WindowStart); err != nil {

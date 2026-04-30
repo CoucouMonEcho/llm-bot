@@ -34,11 +34,11 @@ const sendTimeout = 15 * time.Second
 // Generator 关心的字段也平铺在这里——proactive 内部组件都从同一份 Config
 // 取自己关心的子集，避免再嵌套一层只为了"按职责分组"。
 type Config struct {
-	WindowStart   string
-	WindowEnd     string
-	Interval      time.Duration
-	Jitter        time.Duration
-	IdleThreshold time.Duration
+	WindowStart string
+	WindowEnd   string
+	Interval    time.Duration
+	Jitter      time.Duration
+	BotSilence  time.Duration
 
 	HistorySize     int
 	MaxHistoryChars int
@@ -174,7 +174,7 @@ func (s *Scheduler) RunOnce(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	sessionID, lastAt, ok := pickOldestIdle(groups, now, s.cfg.IdleThreshold)
+	sessionID, lastAt, ok := pickOldestIdle(groups, now, s.cfg.BotSilence)
 	if !ok {
 		s.log.Debug("proactive scheduler skipped", "reason", "no_idle_group")
 		return nil

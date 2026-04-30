@@ -167,7 +167,7 @@ export LLMBOT_SERVER_ACCESS_TOKEN="..."
 
 - 调度器按**单进程**设计，没有分布式锁。多实例部署时应只让一个实例跑 `Scheduler`，或在外部补互斥。
 - 主动消息只有一个开关：Redis `bot_proactive_enabled`。默认 unset 等价于关闭；要启用 `redis-cli SET bot_proactive_enabled true`。
-- 主动消息只面向群聊，群冷却阈值在 `proactive.idle_threshold_sec`（默认 1h）；私聊不在覆盖范围内。
+- 主动消息只面向群聊，bot 沉默阈值在 `proactive.bot_silence_threshold_sec`（默认 1h）；私聊不在覆盖范围内。
 
 ## License
 
