@@ -14,7 +14,7 @@ import (
 
 	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/schema"
-	"github.com/echo/llm-bot/internal/store"
+	"github.com/echo/llm-bot/internal/infra/store"
 )
 
 // GeneratorOptions 汇总 Generator 的模型、历史仓库和配置。
@@ -45,8 +45,7 @@ type Generator struct {
 
 // NewGenerator 构造主动消息生成器。
 //
-// opts.Prompts 应该来自 LoadGeneratorPrompts，已经过 normalized 校验；
-// 这里不再做二次兜底，避免装配期问题被静默压到运行期。
+// opts.Prompts 由装配阶段校验；构造器只保存运行期依赖。
 func NewGenerator(opts GeneratorOptions) *Generator {
 	return &Generator{
 		model:           opts.Model,
@@ -62,8 +61,7 @@ func NewGenerator(opts GeneratorOptions) *Generator {
 //
 // 入参只保留三件事：群 sessionID、群里上一次互动时间、当前时间。生成结果
 // 经过 cleanGeneratedText 清理和敏感片段检查；不合格时返回错误，调度器会
-// 放弃本轮发送。历史已在 store.Load 出口处自带 [YYYY-MM-DD HH:MM] 前缀，
-// formatHistory 不再额外渲染时间。
+// 放弃本轮发送。
 func (g *Generator) Generate(ctx context.Context, sessionID string, lastInboundAt, now time.Time) (string, error) {
 	if g == nil || g.model == nil {
 		return "", fmt.Errorf("proactive: nil generator model")
@@ -127,17 +125,13 @@ func buildSystemPrompt(prompts GeneratorPrompts) string {
 	return b.String()
 }
 
-// buildGeneratorPrompt 组装用户消息。当前只剩群聊一种语境，不再有
-// 会话类型 / 私聊昵称 / 近期群活动等分支字段。
-//
-// 历史已在 Load 出口处自带 `[YYYY-MM-DD HH:MM] ` 前缀，模型自然能看到
-// 时间分布，不必再额外注入。
+// buildGeneratorPrompt 组装主动消息生成任务的用户消息。
 func buildGeneratorPrompt(prompts GeneratorPrompts, now, lastInboundAt time.Time, history []*schema.Message, maxHistoryChars int) string {
 	var b strings.Builder
 	up := prompts.UserPrompt
-	fmt.Fprintf(&b, "%s%s\n", up.CurrentTimeLabel, now.Format(time.RFC3339))
+	_, _ = fmt.Fprintf(&b, "%s%s\n", up.CurrentTimeLabel, now.Format(time.RFC3339))
 	if !lastInboundAt.IsZero() {
-		fmt.Fprintf(&b, "%s%s\n", up.LastInboundAtLabel, lastInboundAt.Format(time.RFC3339))
+		_, _ = fmt.Fprintf(&b, "%s%s\n", up.LastInboundAtLabel, lastInboundAt.Format(time.RFC3339))
 	}
 	b.WriteByte('\n')
 	b.WriteString(up.HistoryHeader)
@@ -199,9 +193,8 @@ func truncateString(s string, maxBytes int) string {
 
 // cleanGeneratedText 清理模型输出并拦截不应发送的片段。
 //
-// 它只做轻量规则：去掉外层引号、压平空白、检查禁用词；复杂安全判断仍由上游
-// guard 和模型提示词负责。forbidden_fragments 这层防御独立于业务路径——即便
-// 业务上不再涉及好感/候选/调度等概念，模型也不该说出这些内部词。
+// 它只做轻量规则：去掉外层引号、压平空白、检查禁用词；复杂安全判断由上游
+// guard 和模型提示词负责。forbidden_fragments 用来拦截不适合发到群里的内部词。
 func cleanGeneratedText(raw string, forbidden []string) (string, error) {
 	text := strings.TrimSpace(raw)
 	if fragment, ok := containsForbiddenFragment(text, forbidden); ok {

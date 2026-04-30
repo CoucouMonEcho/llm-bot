@@ -15,15 +15,13 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"os"
 	"strings"
 	"time"
 
 	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/schema"
-	"github.com/echo/llm-bot/internal/llmjson"
+	"github.com/echo/llm-bot/internal/llmtext"
 	"github.com/redis/go-redis/v9"
-	"gopkg.in/yaml.v3"
 )
 
 const (
@@ -81,25 +79,9 @@ func keyFor(platform, userID string) string {
 	return keyPrefix + cmp.Or(platform, "unknown") + "_" + userID
 }
 
-type updatePromptFile struct {
-	System string `yaml:"system"`
-}
-
 // LoadUpdatePrompt 读取长期记忆更新模型的 system prompt。
 func LoadUpdatePrompt(path string) (string, error) {
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return "", fmt.Errorf("memory: read update prompt file %s: %w", path, err)
-	}
-	var pf updatePromptFile
-	if err := yaml.Unmarshal(raw, &pf); err != nil {
-		return "", fmt.Errorf("memory: parse update prompt yaml: %w", err)
-	}
-	system := strings.TrimSpace(pf.System)
-	if system == "" {
-		return "", fmt.Errorf("memory: update prompt system is required")
-	}
-	return system, nil
+	return llmtext.LoadPromptFile(path, "memory")
 }
 
 type updateResp struct {
@@ -121,7 +103,7 @@ func Update(ctx context.Context, m model.BaseChatModel, systemPrompt, currentMem
 }
 
 func parseUpdateContent(content string, maxChars int) (string, error) {
-	raw := llmjson.StripFence(strings.TrimSpace(content))
+	raw := llmtext.StripCodeFence(strings.TrimSpace(content))
 	var resp updateResp
 	if err := json.Unmarshal([]byte(raw), &resp); err != nil {
 		return "", fmt.Errorf("memory: parse update json %q: %w", raw, err)

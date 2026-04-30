@@ -1,6 +1,6 @@
 // Package nodes 的 score_stats.go 实现"回复生成后触发 stats 打分"的 Lambda 节点。
 //
-// 位置：updatePersonaTopics → scoreStats → END。
+// 位置：updateMemory → scoreStats → END。
 //
 // 本节点只触发异步 Dispatch，不等待打分模型与 Redis 写入完成。触发点是
 // "Agent 已经生成回复"，而不是 Adapter 发送成功：stats 描述的是这轮对话

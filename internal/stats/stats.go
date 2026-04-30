@@ -37,7 +37,7 @@
 //  1. 在 Snapshot / Delta 结构体里加字段；
 //  2. 在 Store.Snapshot / Store.Apply 里把字段加到对应存储（全局量进
 //     keyGlobal、按人量进 keyAffinity 那样的独立 rank 或同一 rank 的新 member）；
-//  3. 在 configs/prompts/stats_score.yaml 和 scoreResp 里加对应的 JSON 字段；
+//  3. 在 stats 打分 prompt 和 scoreResp 里加对应的 JSON 字段；
 //  4. 在 Snapshot.PromptLine 里把新字段渲染成面向 prompt 的短标签。
 //
 // 其他地方（flow.State / Persona.BuildMessages / nodes / bot / main）对存储与
@@ -60,22 +60,20 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"os"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/schema"
-	"github.com/echo/llm-bot/internal/llmjson"
+	"github.com/echo/llm-bot/internal/llmtext"
 	"github.com/redis/go-redis/v9"
-	"gopkg.in/yaml.v3"
 )
 
 // 硬编码的边界与常量。
 //
 // 边界是 stats 语义模型的一部分（与打分 prompt 里声明的 delta 范围一一对应），
-// 允许运维在 YAML 里改动会让打分契约与存储边界脱节，因此刻意不做配置化。
+// 允许运维在 prompt 或配置里改动会让打分契约与存储边界脱节，因此刻意不做配置化。
 const (
 	// Affinity 范围：0 为中性，正为喜欢，负为讨厌。
 	affMin, affMax = -100, 100
@@ -437,25 +435,9 @@ func regressMood(cur int, lastUnix int64, now time.Time) int {
 	return moodBaseline
 }
 
-type scorePromptFile struct {
-	System string `yaml:"system"`
-}
-
 // LoadScorePrompt 读取 stats 打分模型的 system prompt。
 func LoadScorePrompt(path string) (string, error) {
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return "", fmt.Errorf("stats: read score prompt file %s: %w", path, err)
-	}
-	var pf scorePromptFile
-	if err := yaml.Unmarshal(raw, &pf); err != nil {
-		return "", fmt.Errorf("stats: parse score prompt yaml: %w", err)
-	}
-	system := strings.TrimSpace(pf.System)
-	if system == "" {
-		return "", fmt.Errorf("stats: score prompt system is required")
-	}
-	return system, nil
+	return llmtext.LoadPromptFile(path, "stats")
 }
 
 // scoreResp 是打分提示词要求的严格 JSON 结构。
@@ -481,7 +463,7 @@ func Score(ctx context.Context, m model.BaseChatModel, systemPrompt, query, repl
 		return Delta{}, fmt.Errorf("stats: score generate: %w", err)
 	}
 
-	raw := llmjson.StripFence(strings.TrimSpace(msg.Content))
+	raw := llmtext.StripCodeFence(strings.TrimSpace(msg.Content))
 	var resp scoreResp
 	if err := json.Unmarshal([]byte(raw), &resp); err != nil {
 		return Delta{}, fmt.Errorf("stats: parse score json %q: %w", raw, err)

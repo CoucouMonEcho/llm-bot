@@ -4,7 +4,7 @@
 
 ## 功能
 
-- **被动回复**：用 [eino](https://github.com/cloudwego/eino) `compose.Graph` 把 10 个节点串成一条回复链路，拦截、低状态不回复和收尾副作用都收在节点边界里。
+- **被动回复**：用 [eino](https://github.com/cloudwego/eino) `compose.Graph` 把 9 个节点串成一条回复链路，拦截、低状态不回复和收尾副作用都收在节点边界里。
 - **前置注入裁判**：独立 LLM 裁判先判断输入，只有明确输出 `safe` 才读取上下文并调用主模型；非安全输入会静默不回复。
 - **人设参数 stats**：好感度按 "平台+用户" 维度累计、心情全局共享并按沉默时长自然回归；每轮回复后异步打分写回 Redis。
 - **长期记忆**：按 "平台+用户" 保存压缩事实摘要；回复后异步合并更新，与短期对话历史分离。
@@ -41,7 +41,7 @@ flowchart TD
     lowStateGate -- skip --> skipReply
     buildMessages --> chatModel
     chatModel --> postproc
-    postproc --> saveHistory --> updateMemory --> updatePersonaTopics --> scoreStats
+    postproc --> saveHistory --> updateMemory --> scoreStats
     scoreStats --> END([END])
     skipReply[skipReply] --> END
 ```
@@ -53,10 +53,10 @@ flowchart TD
 | `lowStateGate` | 根据低好感度 / 低心情做概率性不回复，最高 50%；命中时直接不发消息，不走兜底话术 |
 | `buildMessages` | 组装 system + history + 当前 user 消息 |
 | `chatModel` | 调用主模型 Generate，写入原始回复 |
-| `postproc` / `saveHistory` / `updateMemory` / `updatePersonaTopics` / `scoreStats` | 清洗回复 → 落历史 → 异步更新长期记忆 → 异步更新话题锚点 → 异步打分 |
+| `postproc` / `saveHistory` / `updateMemory` / `scoreStats` | 清洗回复 → 落历史 → 异步更新长期记忆 → 异步打分 |
 | `skipReply` | 静默结束：不发消息、不入 history、不触发回复后副作用 |
 
-静默中断路径由节点返回 `ErrSkipReply` 触发；Graph 中断后不会进入 `saveHistory` / `updateMemory` / `updatePersonaTopics` / `scoreStats`。
+静默中断路径由节点返回 `ErrSkipReply` 触发；Graph 中断后不会进入 `saveHistory` / `updateMemory` / `scoreStats`。
 
 主动消息侧路完全独立：`Bot` 把每条**群**入站消息（包括未触发 Graph 的普通群文本）旁路写入 `proactive.ActivityRecorder`（HSET `bot_proactive_group_last_inbound`）；`Scheduler` 后台轮询 → 扫这份 HASH 选真实群活跃最久未更新且超过 idle 阈值的群 → `Generator` 拉同群最近几条历史作语气参考 → 生成开场白 → 同一个 `Adapter.Send` 发出 → 发完写入一条 assistant-only 群历史并回写 last_inbound 防自激发。
 
@@ -64,26 +64,25 @@ flowchart TD
 
 ```text
 internal/
-├── adapter/        IM 抽象 + OneBot v11 反向 WS 实现
+├── app/            应用层编排：Bot 主循环、并发控制
 ├── agent/          eino Graph 装配
 │   ├── flow/       Input / State / VerdictKind
-│   ├── guard/      judge / judgeGate
-│   └── nodes/      其余 9 个节点
-├── bot/            Adapter→Agent 主循环、并发控制
+│   └── nodes/      judgeGate + 其余 Graph 节点
 ├── config/         YAML + 环境变量
 ├── domain/         平台无关消息模型
-├── llmjson/        共享小工具：剥 markdown 代码块
+├── infra/          Redis 客户端 + 对话历史 / 群聊缓存 Repo
+├── llmtext/        共享小工具：加载 prompt、剥 markdown 代码块
 ├── memory/         长期记忆 Store + 异步更新
+├── platform/       IM 抽象 + OneBot v11 反向 WS 实现
 ├── proactive/      State / Recorder / Generator / Scheduler
-├── stats/          好感度 / 心情 Store + 异步打分
-└── store/          Redis 客户端 + 对话历史 Repo
+└── stats/          好感度 / 心情 Store + 异步打分
 ```
 
 ## Redis 存储速查
 
 所有 key 形如 `bot_<模块>_<...>`。下表是当前**全集**，写下来供排查时直接 `redis-cli`。
 
-### 对话历史 — `internal/store`
+### 对话历史 — `internal/infra/store`
 
 | Key | 类型 | 内容 | TTL |
 |-----|------|------|-----|
@@ -151,7 +150,7 @@ HDEL    bot_proactive_group_last_inbound group_789  # 把某个群从候选中�
 ```bash
 make build && make run
 # 或
-go run ./cmd/bot -config configs/config.yaml
+go run ./cmd/llm-bot -config configs/config.yaml
 ```
 
 敏感配置走环境变量覆盖：
@@ -163,7 +162,7 @@ export LLMBOT_REDIS_PASSWORD="..."
 export LLMBOT_SERVER_ACCESS_TOKEN="..."
 ```
 
-人设、护栏、打分契约、记忆更新契约都在 `configs/prompts/*.yaml` 里，改完重启进程才生效。
+人设与主动消息 prompt 在 `configs/prompts/persona/`，护栏、打分契约、记忆更新契约在 `configs/prompts/` 下按职责分目录保存。改完重启进程才生效。
 
 ## 注意
 

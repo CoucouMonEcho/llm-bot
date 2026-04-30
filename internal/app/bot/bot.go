@@ -14,13 +14,13 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/echo/llm-bot/internal/adapter"
 	"github.com/echo/llm-bot/internal/agent"
 	"github.com/echo/llm-bot/internal/agent/flow"
 	"github.com/echo/llm-bot/internal/config"
 	"github.com/echo/llm-bot/internal/domain"
+	"github.com/echo/llm-bot/internal/infra/store"
+	"github.com/echo/llm-bot/internal/platform/adapter"
 	"github.com/echo/llm-bot/internal/proactive"
-	"github.com/echo/llm-bot/internal/store"
 )
 
 // maxConcurrent 单进程同时处理的最大消息数。

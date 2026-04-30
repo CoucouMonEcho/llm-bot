@@ -142,7 +142,7 @@ func (r *redisGroupBufferRepo) Load(ctx context.Context, sessionID string) ([]Gr
 	return out, nil
 }
 
-// keyFor 是包内 helper，保持小写不导出——key 命名是 store 内部的实现细节，
+// keyFor 是包内辅助函数，保持小写不导出——key 命名是 store 内部的实现细节，
 // 不能让外面拿着拼字符串去绕过 Repo 直读 Redis。
 func (r *redisGroupBufferRepo) keyFor(sessionID string) string {
 	return r.keyPrefix + sessionID

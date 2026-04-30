@@ -1,6 +1,6 @@
 // Package nodes 的 save_history.go 实现"把本轮对话写回 Redis"的 Lambda 节点。
 //
-// 位置：postproc → saveHistory → updateMemory → updatePersonaTopics → scoreStats → END。
+// 位置：postproc → saveHistory → updateMemory → scoreStats → END。
 // 只有"正常回复"路径会走到这里——被 guard 判定为攻击的消息会静默中断，
 // 不发回复、不入历史，也不触发回复后副作用。
 //
@@ -19,7 +19,7 @@ import (
 	"github.com/cloudwego/eino/compose"
 	"github.com/cloudwego/eino/schema"
 	"github.com/echo/llm-bot/internal/agent/flow"
-	"github.com/echo/llm-bot/internal/store"
+	"github.com/echo/llm-bot/internal/infra/store"
 )
 
 // NewSaveHistory 构造 saveHistory 节点。

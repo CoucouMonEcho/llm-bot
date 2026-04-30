@@ -4,9 +4,9 @@
 //  1. 解析命令行 flag 找到 config.yaml；
 //  2. 加载配置、构造 logger；
 //  3. 连 Redis，构造 HistoryRepo；
-//  4. 加载人设与裁判 prompt YAML；
-//  5. 必要时构造 stats / memory / persona topics 共用的 judge ChatModel；
-//  6. 构造 stats / memory / persona topics 资源（若启用）：Store、prompt 与异步更新 ChatModel；
+//  4. 加载人设与裁判 prompt；
+//  5. 必要时构造 stats / memory 共用的 judge ChatModel；
+//  6. 构造 stats / memory 资源（若启用）：Store、prompt 与异步更新 ChatModel；
 //  7. 构造 Agent Runnable（这一步会构造主/裁判 ChatModel、编译 Graph）；
 //  8. 构造 OneBot Adapter；
 //  9. 构造主动消息资源（始终构造，运行期由 Redis 开关控制）；
@@ -25,16 +25,15 @@ import (
 	"time"
 
 	"github.com/cloudwego/eino/components/model"
-	"github.com/echo/llm-bot/internal/adapter/onebot"
 	"github.com/echo/llm-bot/internal/agent"
-	"github.com/echo/llm-bot/internal/agent/guard"
-	"github.com/echo/llm-bot/internal/bot"
+	"github.com/echo/llm-bot/internal/app/bot"
 	"github.com/echo/llm-bot/internal/config"
+	"github.com/echo/llm-bot/internal/infra/store"
+	"github.com/echo/llm-bot/internal/llmtext"
 	"github.com/echo/llm-bot/internal/memory"
-	"github.com/echo/llm-bot/internal/persona"
+	"github.com/echo/llm-bot/internal/platform/adapter/onebot"
 	"github.com/echo/llm-bot/internal/proactive"
 	"github.com/echo/llm-bot/internal/stats"
-	"github.com/echo/llm-bot/internal/store"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -85,29 +84,28 @@ func main() {
 		fatal("load persona: %v", err)
 	}
 
-	judgePrompt, err := guard.LoadJudgePrompt(cfg.Guard.JudgePromptFile)
+	judgePrompt, err := llmtext.LoadPromptFile(cfg.Guard.JudgePromptFile, "guard")
 	if err != nil {
 		fatal("load judge prompt: %v", err)
 	}
 
-	// 步骤 5：stats / memory / persona topics 都用 cfg.Judge 做异步打分 / 摘要更新；只有任一启用时
+	// 步骤 5：stats / memory 都用 cfg.Judge 做异步打分 / 摘要更新；只有任一启用时
 	// 才构造一次共享的 judge ChatModel，避免没用上还白白连一次模型 API。
 	var judgeModel model.BaseChatModel
-	if cfg.Stats.Enabled || cfg.Memory.Enabled || cfg.PersonaTopics.Enabled {
+	if cfg.Stats.Enabled || cfg.Memory.Enabled {
 		judgeModel, err = agent.NewChatModel(ctx, cfg.Judge)
 		if err != nil {
 			fatal("build judge chat model: %v", err)
 		}
 	}
 
-	// 步骤 6：构造 stats / memory / persona topics 资源（若启用）。
+	// 步骤 6：构造 stats / memory 资源（若启用）。
 	// stats 产出三件东西:
 	//   - statsStore：传给 agent.Build，用于 prepareStats 节点结算并读取参数快照；
 	//   - scorePrompt：传给 scoreStats 节点作为打分模型的 system prompt；
 	//   - scoreModel：传给 agent.Build，用于 scoreStats 节点在回复生成后异步打分。
-	// memory / persona topics 同理传入各自的 Store / prompt / model，用于读取上下文
-	// 与回复后的异步摘要更新。
-	// 三条异步链路都复用 cfg.Judge——负载特征（短 prompt、严格 JSON、低 QPS）
+	// memory 同理传入 Store / prompt / model，用于读取上下文与回复后的异步摘要更新。
+	// 两条异步链路都复用 cfg.Judge——负载特征（短 prompt、严格 JSON、低 QPS）
 	// 与 judge 接近，共享一份配置避免再引入额外 LLM 配置段。
 	//
 	// 功能关闭时这些资源都保持零值；agent graph 内部会安全处理 nil，main 这里
@@ -120,27 +118,20 @@ func main() {
 	if err != nil {
 		fatal("%v", err)
 	}
-	personaTopicStore, personaTopicModel, personaTopicPrompt, err := buildPersonaTopics(cfg, redisCli, logger, judgeModel)
-	if err != nil {
-		fatal("%v", err)
-	}
 
 	// 步骤 7：构造 Agent Runnable。
 	runnable, err := agent.Build(ctx, cfg, agent.Deps{
-		History:            historyRepo,
-		Persona:            persona,
-		Logger:             logger,
-		Stats:              statsStore,
-		Memory:             memoryStore,
-		PersonaTopics:      personaTopicStore,
-		GroupBuffer:        groupBuffer,
-		JudgePrompt:        judgePrompt,
-		ScoreModel:         scoreModel,
-		ScorePrompt:        scorePrompt,
-		MemoryModel:        memoryModel,
-		MemoryPrompt:       memoryPrompt,
-		PersonaTopicModel:  personaTopicModel,
-		PersonaTopicPrompt: personaTopicPrompt,
+		History:      historyRepo,
+		Persona:      persona,
+		Logger:       logger,
+		Stats:        statsStore,
+		Memory:       memoryStore,
+		GroupBuffer:  groupBuffer,
+		JudgePrompt:  judgePrompt,
+		ScoreModel:   scoreModel,
+		ScorePrompt:  scorePrompt,
+		MemoryModel:  memoryModel,
+		MemoryPrompt: memoryPrompt,
 	})
 	if err != nil {
 		fatal("build agent: %v", err)
@@ -192,9 +183,9 @@ func buildStats(cfg *config.Config, redisCli *redis.Client, logger *slog.Logger,
 	if err != nil {
 		return nil, nil, "", fmt.Errorf("load stats score prompt: %w", err)
 	}
-	store := stats.NewStore(redisCli, logger)
+	statsStore := stats.NewStore(redisCli, logger)
 	logger.Info("stats feature enabled")
-	return store, judgeModel, scorePrompt, nil
+	return statsStore, judgeModel, scorePrompt, nil
 }
 
 // buildMemory 构造长期记忆所需的 Store / 更新模型 / 更新 prompt。
@@ -208,27 +199,9 @@ func buildMemory(cfg *config.Config, redisCli *redis.Client, logger *slog.Logger
 	if err != nil {
 		return nil, nil, "", fmt.Errorf("load memory update prompt: %w", err)
 	}
-	store := memory.NewStore(redisCli, logger)
+	memoryStore := memory.NewStore(redisCli, logger)
 	logger.Info("memory feature enabled", slog.Int("max_chars", cfg.Memory.MaxChars))
-	return store, judgeModel, updatePrompt, nil
-}
-
-// buildPersonaTopics 构造闲聊话题锚点所需的 Store / 更新模型 / 更新 prompt。
-//
-// 关闭时返回零值。和 buildStats / buildMemory 一样，靠共享的 judgeModel 复用 cfg.Judge。
-func buildPersonaTopics(cfg *config.Config, redisCli *redis.Client, logger *slog.Logger, judgeModel model.BaseChatModel) (*persona.Store, model.BaseChatModel, string, error) {
-	if !cfg.PersonaTopics.Enabled {
-		return nil, nil, "", nil
-	}
-	updatePrompt, err := persona.LoadUpdatePrompt(cfg.PersonaTopics.UpdatePromptFile)
-	if err != nil {
-		return nil, nil, "", fmt.Errorf("load persona topics update prompt: %w", err)
-	}
-	store := persona.NewStore(redisCli, logger)
-	logger.Info("persona topics feature enabled",
-		slog.Int("max_items", cfg.PersonaTopics.MaxItems),
-		slog.Int("max_age_hours", cfg.PersonaTopics.MaxAgeHours))
-	return store, judgeModel, updatePrompt, nil
+	return memoryStore, judgeModel, updatePrompt, nil
 }
 
 // buildProactiveScheduler 构造主动消息调度器。

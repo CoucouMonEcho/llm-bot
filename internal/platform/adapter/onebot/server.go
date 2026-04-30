@@ -118,7 +118,7 @@ func (a *Adapter) Start(ctx context.Context) error {
 			}
 		}()
 
-		// ctx 结束 → 优雅关闭。
+		// ctx 结束后优雅关闭。
 		go func() {
 			<-ctx.Done()
 			_ = a.Stop(context.Background())
@@ -153,7 +153,7 @@ func (a *Adapter) Receive() <-chan *domain.InboundMessage { return a.recv }
 
 // Send 把 OutboundMessage 翻译成 OneBot action 并写到 active connection。
 // 若当前没有活跃连接，返回错误——消息丢失但保留可观测。
-func (a *Adapter) Send(ctx context.Context, out *domain.OutboundMessage) error {
+func (a *Adapter) Send(_ context.Context, out *domain.OutboundMessage) error {
 	payload, err := buildSendAction(out)
 	if err != nil {
 		return err
@@ -177,7 +177,7 @@ func (a *Adapter) Send(ctx context.Context, out *domain.OutboundMessage) error {
 
 // handleWS 是 HTTP handler：完成 access_token 校验后升级到 WS 并进入 readLoop。
 func (a *Adapter) handleWS(w http.ResponseWriter, r *http.Request) {
-	// Step 1: 校验 access_token（NapCat 会把 token 放在 Authorization 头里）。
+	// 步骤 1：校验 access_token（NapCat 会把 token 放在 Authorization 头里）。
 	if a.cfg.AccessToken != "" {
 		// 优先 Authorization Bearer，空时兜底到 X-Self-Token（部分客户端走这个头）。
 		token := cmp.Or(extractBearer(r.Header.Get("Authorization")), r.Header.Get("X-Self-Token"))
@@ -188,7 +188,7 @@ func (a *Adapter) handleWS(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Step 2: 升级到 WebSocket。
+	// 步骤 2：升级到 WebSocket。
 	conn, err := a.upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		a.logger.Error("onebot ws upgrade failed", slog.Any("err", err))
@@ -196,10 +196,10 @@ func (a *Adapter) handleWS(w http.ResponseWriter, r *http.Request) {
 	}
 	a.logger.Info("onebot ws connected", slog.String("remote", r.RemoteAddr))
 
-	// Step 3: 读取 X-Self-ID 头取得机器人自己的 QQ 号，用于 @ 识别。
+	// 步骤 3：读取 X-Self-ID 头取得机器人自己的 QQ 号，用于 @ 识别。
 	selfID, _ := strconv.ParseInt(r.Header.Get("X-Self-ID"), 10, 64)
 
-	// Step 4: 登记为 active connection；同一进程内只保留最近一条。
+	// 步骤 4：登记为 active connection；同一进程内只保留最近一条。
 	a.connMu.Lock()
 	if a.activeConn != nil {
 		_ = a.activeConn.Close()
@@ -207,7 +207,7 @@ func (a *Adapter) handleWS(w http.ResponseWriter, r *http.Request) {
 	a.activeConn = conn
 	a.connMu.Unlock()
 
-	// Step 5: 进入 readLoop，直到连接出错或对端关闭。
+	// 步骤 5：进入 readLoop，直到连接出错或对端关闭。
 	a.readLoop(conn, selfID)
 }
 

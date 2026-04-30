@@ -9,7 +9,7 @@
 #   make clean     清理编译产物
 
 BIN       := bin/bot
-PKG       := ./cmd/bot
+PKG       := ./cmd/llm-bot
 CONFIG    := configs/config.yaml
 GOFLAGS   := -trimpath
 

@@ -108,10 +108,6 @@ type State struct {
 	// Memory 负责跨会话保留高度压缩的偏好、近况与雷区。为空表示无可用记忆。
 	Memory string
 
-	// CasualTopics 是本轮对话开始时读取到的全局闲聊话题锚点。
-	// 它只保存短、可复用的话题文本，不保存用户画像或长期事实；读取失败或功能关闭时为空。
-	CasualTopics []string
-
 	// GroupBackground 是 loadContext 节点根据短期群聊缓存渲染好的"刚才群里在聊什么"的背景文本。
 	// 仅当 In.ConvType == "group" 且仓库返回非空时填充；私聊或缓存关闭/读失败时保持空串，
 	// buildMessages 据此决定是否注入背景块。

@@ -21,20 +21,19 @@ import (
 
 // Config 是整个应用的配置根对象，字段与 configs/config.yaml 一一对应。
 type Config struct {
-	Server        Server        `yaml:"server"`
-	Redis         Redis         `yaml:"redis"`
-	LLM           LLM           `yaml:"llm"`
-	Judge         LLM           `yaml:"judge"`
-	Agent         Agent         `yaml:"agent"`
-	Guard         Guard         `yaml:"guard"`
-	Trigger       Trigger       `yaml:"trigger"`
-	GroupBuffer   GroupBuffer   `yaml:"group_buffer"`
-	Blacklist     Blacklist     `yaml:"blacklist"`
-	Log           Log           `yaml:"log"`
-	Stats         Stats         `yaml:"stats"`
-	Memory        Memory        `yaml:"memory"`
-	PersonaTopics PersonaTopics `yaml:"persona_topics"`
-	Proactive     Proactive     `yaml:"proactive"`
+	Server      Server      `yaml:"server"`
+	Redis       Redis       `yaml:"redis"`
+	LLM         LLM         `yaml:"llm"`
+	Judge       LLM         `yaml:"judge"`
+	Agent       Agent       `yaml:"agent"`
+	Guard       Guard       `yaml:"guard"`
+	Trigger     Trigger     `yaml:"trigger"`
+	GroupBuffer GroupBuffer `yaml:"group_buffer"`
+	Blacklist   Blacklist   `yaml:"blacklist"`
+	Log         Log         `yaml:"log"`
+	Stats       Stats       `yaml:"stats"`
+	Memory      Memory      `yaml:"memory"`
+	Proactive   Proactive   `yaml:"proactive"`
 }
 
 // Blacklist 控制需要在 Adapter 源头忽略的账号。
@@ -53,7 +52,7 @@ type Blacklist struct {
 // 模型，不额外引入新的 LLM 配置段。
 type Stats struct {
 	Enabled bool `yaml:"enabled"`
-	// ScorePromptFile 是 stats 打分模型 system prompt 的 YAML 文件路径。
+	// ScorePromptFile 是 stats 打分模型 system prompt 的 Markdown 文件路径。
 	ScorePromptFile string `yaml:"score_prompt_file"`
 }
 
@@ -64,33 +63,10 @@ type Stats struct {
 // 一段按"平台 + 用户"维度压缩后的事实文本。
 type Memory struct {
 	Enabled bool `yaml:"enabled"`
-	// UpdatePromptFile 是长期记忆更新模型 system prompt 的 YAML 文件路径。
+	// UpdatePromptFile 是长期记忆更新模型 system prompt 的 Markdown 文件路径。
 	UpdatePromptFile string `yaml:"update_prompt_file"`
 	// MaxChars 限制注入和保存的长期记忆最大字符数。
 	MaxChars int `yaml:"max_chars"`
-}
-
-// PersonaTopics 控制全局闲聊话题锚点。
-//
-// Enabled=false 时，agent 不读写话题锚点，系统提示词也不会出现话题块。
-// Enabled=true 时复用 cfg.Judge 的 LLM 在正常回复后异步整理少量短话题；
-// Redis 中使用一个全局 ZSET 保存 topic -> last_update_unix。
-type PersonaTopics struct {
-	Enabled bool `yaml:"enabled"`
-	// MaxItems 限制注入和保存的最大话题数量。
-	MaxItems int `yaml:"max_items"`
-	// MaxAgeHours 限制话题最长存活时间，过期成员由 ZREMRANGEBYSCORE 清理。
-	MaxAgeHours int `yaml:"max_age_hours"`
-	// UpdatePromptFile 是话题更新模型 system prompt 的 YAML 文件路径。
-	UpdatePromptFile string `yaml:"update_prompt_file"`
-}
-
-// MaxAge 把 MaxAgeHours 暴露成 time.Duration。
-func (p PersonaTopics) MaxAge() time.Duration {
-	if p.MaxAgeHours <= 0 {
-		return 0
-	}
-	return time.Duration(p.MaxAgeHours) * time.Hour
 }
 
 // Proactive 控制主动发消息的静态策略。YAML 只保存部署期参数；
@@ -104,7 +80,7 @@ func (p PersonaTopics) MaxAge() time.Duration {
 // 这里的时间字段保留为秒数，是为了让配置文件易读；对外统一通过方法转成
 // time.Duration，避免调用方散落重复换算。
 type Proactive struct {
-	// PromptFile 是主动消息生成提示词 YAML 文件路径。
+	// PromptFile 是主动消息生成提示词 Markdown 文件路径。
 	PromptFile string `yaml:"prompt_file"`
 	// WindowStart / WindowEnd 是每天允许主动发送的时间窗边界，格式为 HH:MM。
 	// 默认允许跨天窗口（例如 10:00 到 01:00），以覆盖深夜仍活跃的群。
@@ -179,7 +155,7 @@ type Agent struct {
 	// HistorySize 是 Redis 中每个 session 保留的最近对话条数上限。
 	// 每次写入后通过 LTRIM 0 HistorySize-1 裁剪。
 	HistorySize int `yaml:"history_size"`
-	// PromptFile 是人设 YAML 文件的路径（相对工作目录）。
+	// PromptFile 是人设 Markdown 文件的路径（相对工作目录）。
 	PromptFile string `yaml:"prompt_file"`
 	// EmptyReplyFallback 是主链回复清洗后为空时发送的兜底文案。
 	EmptyReplyFallback string `yaml:"empty_reply_fallback"`
@@ -187,7 +163,7 @@ type Agent struct {
 
 // Guard 描述固定启用的 LLM 裁判参数；裁判未明确输出 safe 时静默不回复。
 type Guard struct {
-	// JudgePromptFile 是 LLM 裁判 system prompt 的 YAML 文件路径。
+	// JudgePromptFile 是 LLM 裁判 system prompt 的 Markdown 文件路径。
 	// 裁判固定作为输入侧安全判定：只有明确输出 safe 才进入主链。
 	JudgePromptFile string `yaml:"judge_prompt_file"`
 }
@@ -249,10 +225,9 @@ func Load(path string) (*Config, error) {
 	}
 
 	cfg := Config{
-		Proactive:     defaultProactive(),
-		Memory:        defaultMemory(),
-		PersonaTopics: defaultPersonaTopics(),
-		GroupBuffer:   defaultGroupBuffer(),
+		Proactive:   defaultProactive(),
+		Memory:      defaultMemory(),
+		GroupBuffer: defaultGroupBuffer(),
 	}
 	if err := yaml.Unmarshal(raw, &cfg); err != nil {
 		return nil, fmt.Errorf("config: unmarshal %s: %w", path, err)
@@ -318,7 +293,6 @@ func (c *Config) validate() error {
 	if c.Memory.MaxChars <= 0 {
 		c.Memory.MaxChars = defaultMemory().MaxChars
 	}
-	c.normalizePersonaTopics()
 	if c.Agent.PromptFile == "" {
 		return fmt.Errorf("config: agent.prompt_file is required")
 	}
@@ -370,7 +344,7 @@ func (c *Config) normalizeBlacklist() {
 
 func defaultProactive() Proactive {
 	return Proactive{
-		PromptFile:       "configs/prompts/persona.yaml",
+		PromptFile:       "configs/prompts/persona/generator.md",
 		WindowStart:      "10:00",
 		WindowEnd:        "01:00",
 		IntervalSec:      int((10 * time.Minute) / time.Second),
@@ -382,31 +356,8 @@ func defaultProactive() Proactive {
 func defaultMemory() Memory {
 	return Memory{
 		Enabled:          false,
-		UpdatePromptFile: "configs/prompts/memory_update.yaml",
+		UpdatePromptFile: "configs/prompts/memory/update.md",
 		MaxChars:         1200,
-	}
-}
-
-func defaultPersonaTopics() PersonaTopics {
-	return PersonaTopics{
-		Enabled:          true,
-		MaxItems:         5,
-		MaxAgeHours:      12,
-		UpdatePromptFile: "configs/prompts/persona_topics_update.yaml",
-	}
-}
-
-func (c *Config) normalizePersonaTopics() {
-	defaults := defaultPersonaTopics()
-	if c.PersonaTopics.MaxItems <= 0 {
-		c.PersonaTopics.MaxItems = defaults.MaxItems
-	}
-	if c.PersonaTopics.MaxAgeHours <= 0 {
-		c.PersonaTopics.MaxAgeHours = defaults.MaxAgeHours
-	}
-	c.PersonaTopics.UpdatePromptFile = strings.TrimSpace(c.PersonaTopics.UpdatePromptFile)
-	if c.PersonaTopics.UpdatePromptFile == "" {
-		c.PersonaTopics.UpdatePromptFile = defaults.UpdatePromptFile
 	}
 }
 

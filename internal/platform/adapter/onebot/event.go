@@ -75,7 +75,7 @@ func decodeAndFilter(raw []byte, selfID int64, tr config.Trigger, blacklist conf
 		return nil, fmt.Errorf("onebot: unmarshal event: %w", err)
 	}
 
-	// Step 1: 过滤非消息事件（心跳 / meta_event / notice / request 等）。
+	// 步骤 1：过滤非消息事件（心跳 / meta_event / notice / request 等）。
 	if ev.PostType != postTypeMessage {
 		return nil, nil
 	}
@@ -84,13 +84,13 @@ func decodeAndFilter(raw []byte, selfID int64, tr config.Trigger, blacklist conf
 		return nil, nil
 	}
 
-	// Step 3: 把 message 字段统一规约为 plainText + 是否 @ 了自己。
+	// 步骤 3：把 message 字段统一规约为 plainText + 是否 @ 了自己。
 	plainText, atSelf, err := extractText(ev.Message, ev.RawMessage, selfID)
 	if err != nil {
 		return nil, fmt.Errorf("onebot: extract text: %w", err)
 	}
 
-	// Step 4: 按会话类型与配置做触发过滤，并记录显式触发元信息。
+	// 步骤 4：按会话类型与配置做触发过滤，并记录显式触发元信息。
 	explicitTrigger := false
 	switch ev.MessageType {
 	case "private":
@@ -119,7 +119,7 @@ func decodeAndFilter(raw []byte, selfID int64, tr config.Trigger, blacklist conf
 		plainText = emptyTriggerPlaceholder
 	}
 
-	// Step 5: 组装 InboundMessage。
+	// 步骤 5：组装 InboundMessage。
 	convType := domain.ConversationPrivate
 	sessionID := "private_" + strconv.FormatInt(ev.UserID, 10)
 	if ev.MessageType == "group" {

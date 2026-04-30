@@ -2,12 +2,11 @@
 //
 // Build 负责：
 //  1. 构造主模型 / 裁判模型；
-//  2. 构造 Judge；
-//  3. 把 judgeGate / loadContext / lowStateGate / buildMessages /
-//     chatModel / postproc / saveHistory / updateMemory / updatePersonaTopics / scoreStats 十个节点
+//  2. 构造 judgeGate / loadContext / lowStateGate / buildMessages /
+//     chatModel / postproc / saveHistory / updateMemory / scoreStats 九个节点
 //     装配成 compose.Graph
 //     并编译为 Runnable；
-//  4. 返回 Runnable 给 Bot 主循环。
+//  3. 返回 Runnable 给 Bot 主循环。
 //
 // 顶层 Graph 形态：
 //
@@ -26,9 +25,6 @@
 //	                                              updateMemory
 //	                                                   │
 //	                                                   ▼
-//	                                          updatePersonaTopics
-//	                                                   │
-//	                                                   ▼
 //	                                             scoreStats
 //	                                                   │
 //	                                                   ▼
@@ -43,13 +39,11 @@ import (
 	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/compose"
 	"github.com/echo/llm-bot/internal/agent/flow"
-	"github.com/echo/llm-bot/internal/agent/guard"
 	"github.com/echo/llm-bot/internal/agent/nodes"
 	"github.com/echo/llm-bot/internal/config"
+	"github.com/echo/llm-bot/internal/infra/store"
 	"github.com/echo/llm-bot/internal/memory"
-	"github.com/echo/llm-bot/internal/persona"
 	"github.com/echo/llm-bot/internal/stats"
-	"github.com/echo/llm-bot/internal/store"
 )
 
 // Deps 聚合构造 Agent 所需的外部依赖。
@@ -73,12 +67,6 @@ type Deps struct {
 	MemoryModel model.BaseChatModel
 	// MemoryPrompt 是长期记忆更新模型的 system prompt；仅在 MemoryModel 非 nil 时使用。
 	MemoryPrompt string
-	// PersonaTopics 可为 nil，表示关闭闲聊话题锚点注入与更新。
-	PersonaTopics *persona.Store
-	// PersonaTopicModel 可为 nil，表示不触发回复后的闲聊话题锚点异步更新。
-	PersonaTopicModel model.BaseChatModel
-	// PersonaTopicPrompt 是闲聊话题更新模型的 system prompt；仅在 PersonaTopicModel 非 nil 时使用。
-	PersonaTopicPrompt string
 	// GroupBuffer 可为 nil，表示关闭群聊短期上下文背景注入。
 	// 节点内部负责跳过 nil。
 	GroupBuffer store.GroupBufferRepo
@@ -90,16 +78,15 @@ type Runnable = compose.Runnable[*flow.Input, *flow.State]
 
 // 节点 key 常量化，避免字符串散落。
 const (
-	nodeJudgeGate           = "judgeGate"
-	nodeLoadContext         = "loadContext"
-	nodeLowStateGate        = "lowStateGate"
-	nodeBuildMessages       = "buildMessages"
-	nodeChatModel           = "chatModel"
-	nodePostproc            = "postproc"
-	nodeSaveHistory         = "saveHistory"
-	nodeUpdateMemory        = "updateMemory"
-	nodeUpdatePersonaTopics = "updatePersonaTopics"
-	nodeScoreStats          = "scoreStats"
+	nodeJudgeGate     = "judgeGate"
+	nodeLoadContext   = "loadContext"
+	nodeLowStateGate  = "lowStateGate"
+	nodeBuildMessages = "buildMessages"
+	nodeChatModel     = "chatModel"
+	nodePostproc      = "postproc"
+	nodeSaveHistory   = "saveHistory"
+	nodeUpdateMemory  = "updateMemory"
+	nodeScoreStats    = "scoreStats"
 )
 
 // Build 按配置装配 Agent Runnable。
@@ -116,20 +103,18 @@ func Build(ctx context.Context, cfg *config.Config, deps Deps) (Runnable, error)
 	if err != nil {
 		return nil, fmt.Errorf("agent: new judge chat model: %w", err)
 	}
-	judge := guard.NewJudge(judgeModel, deps.JudgePrompt)
 
 	// 步骤 2：构造各节点 Lambda。
 	// buildMessages 节点用函数字面量注入 Persona.BuildMessages，避免 nodes
 	// 反向依赖 agent 包（会形成 import 环）。
-	judgeGateNode := guard.NewJudgeGate(judge, deps.Logger)
-	loadContextNode := nodes.NewLoadContext(deps.Stats, deps.Memory, deps.PersonaTopics, deps.History, deps.GroupBuffer, cfg.Memory.MaxChars, cfg.Agent.HistorySize, cfg.PersonaTopics.MaxItems, cfg.PersonaTopics.MaxAge(), deps.Logger)
+	judgeGateNode := nodes.NewJudgeGate(judgeModel, deps.JudgePrompt, deps.Logger)
+	loadContextNode := nodes.NewLoadContext(deps.Stats, deps.Memory, deps.History, deps.GroupBuffer, cfg.Memory.MaxChars, cfg.Agent.HistorySize, deps.Logger)
 	lowStateGateNode := nodes.NewLowStateGate()
 	buildMessagesNode := nodes.NewBuildMessages(deps.Persona.BuildMessages)
 	chatModelNode := nodes.NewChatModel(mainModel)
 	postprocNode := nodes.NewPostproc(cfg.Agent.EmptyReplyFallback)
 	saveHistoryNode := nodes.NewSaveHistory(deps.History, cfg.Agent.HistorySize, deps.Logger)
 	updateMemoryNode := nodes.NewUpdateMemory(deps.Memory, deps.MemoryModel, deps.MemoryPrompt, cfg.Memory.MaxChars, deps.Logger)
-	updatePersonaTopicsNode := nodes.NewUpdatePersonaTopics(deps.PersonaTopics, deps.PersonaTopicModel, deps.PersonaTopicPrompt, cfg.PersonaTopics.MaxItems, cfg.PersonaTopics.MaxAge(), deps.Logger)
 	scoreStatsNode := nodes.NewScoreStats(deps.Stats, deps.ScoreModel, deps.ScorePrompt, deps.Logger)
 
 	// 步骤 3：装配 Graph。
@@ -147,7 +132,6 @@ func Build(ctx context.Context, cfg *config.Config, deps Deps) (Runnable, error)
 		{nodePostproc, postprocNode},
 		{nodeSaveHistory, saveHistoryNode},
 		{nodeUpdateMemory, updateMemoryNode},
-		{nodeUpdatePersonaTopics, updatePersonaTopicsNode},
 		{nodeScoreStats, scoreStatsNode},
 	} {
 		if err := g.AddLambdaNode(add.key, add.lambda); err != nil {
@@ -166,8 +150,7 @@ func Build(ctx context.Context, cfg *config.Config, deps Deps) (Runnable, error)
 		{nodeChatModel, nodePostproc},
 		{nodePostproc, nodeSaveHistory},
 		{nodeSaveHistory, nodeUpdateMemory},
-		{nodeUpdateMemory, nodeUpdatePersonaTopics},
-		{nodeUpdatePersonaTopics, nodeScoreStats},
+		{nodeUpdateMemory, nodeScoreStats},
 		{nodeScoreStats, compose.END},
 	}
 	for _, e := range edges {
@@ -183,15 +166,13 @@ func Build(ctx context.Context, cfg *config.Config, deps Deps) (Runnable, error)
 	}
 
 	deps.Logger.Info("agent graph compiled",
-		slog.String("main_path", "judgeGate->loadContext->lowStateGate->buildMessages->chatModel->postproc->saveHistory->updateMemory->updatePersonaTopics->scoreStats"),
+		slog.String("main_path", "judgeGate->loadContext->lowStateGate->buildMessages->chatModel->postproc->saveHistory->updateMemory->scoreStats"),
 		slog.String("blocked_path", "skipReply"),
 		slog.Int("history_size", cfg.Agent.HistorySize),
 		slog.Bool("stats_enabled", deps.Stats != nil),
 		slog.Bool("stats_scoring_enabled", deps.Stats != nil && deps.ScoreModel != nil),
 		slog.Bool("memory_enabled", deps.Memory != nil),
 		slog.Bool("memory_update_enabled", deps.Memory != nil && deps.MemoryModel != nil),
-		slog.Bool("persona_topics_enabled", deps.PersonaTopics != nil),
-		slog.Bool("persona_topics_update_enabled", deps.PersonaTopics != nil && deps.PersonaTopicModel != nil),
 		slog.Bool("group_buffer_enabled", deps.GroupBuffer != nil))
 
 	return runnable, nil

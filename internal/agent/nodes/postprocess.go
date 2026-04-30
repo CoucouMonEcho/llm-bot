@@ -1,4 +1,4 @@
-// Package nodes 实现 Agent Graph 中的非 guard Lambda 节点。
+// Package nodes 实现 Agent Graph 中的回复后处理节点。
 //
 // 本文件：postproc 节点。
 // 位置：chatModel → postproc → saveHistory → updateMemory → scoreStats。
