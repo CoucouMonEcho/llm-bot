@@ -17,11 +17,6 @@ import (
 	"github.com/echo/llm-bot/internal/agent/flow"
 )
 
-const (
-	judgeTokenSafe   = "safe"
-	judgeTokenAttack = "attack"
-)
-
 // NewJudgeGate 构造 judgeGate 节点。
 //
 // judgeModel 为 nil、prompt 为空或调用失败时都按不放行处理。删掉正则层后，
@@ -43,7 +38,7 @@ func NewJudgeGate(judgeModel model.BaseChatModel, systemPrompt string, logger *s
 			return nil, flow.ErrSkipReply
 		}
 
-		safe, err := classifyByJudge(ctx, judgeModel, systemPrompt, query)
+		output, err := classifyByJudge(ctx, judgeModel, systemPrompt, query)
 		if err != nil {
 			st.VerdictKind = flow.VerdictJudge
 			lg.Warn("judge error, fail-closed",
@@ -51,33 +46,29 @@ func NewJudgeGate(judgeModel model.BaseChatModel, systemPrompt string, logger *s
 				slog.Any("err", err))
 			return nil, flow.ErrSkipReply
 		}
-		if !safe {
+		switch output {
+		case "safe":
+			return st, nil
+		default:
 			st.VerdictKind = flow.VerdictJudge
-			lg.Info("judge blocked", slog.String("session", session))
+			lg.Info("judge blocked", slog.String("session", session),
+				slog.String("raw_output", output))
 			return nil, flow.ErrSkipReply
 		}
-		return st, nil
 	})
 }
 
-func classifyByJudge(ctx context.Context, judgeModel model.BaseChatModel, systemPrompt, input string) (bool, error) {
+func classifyByJudge(ctx context.Context, judgeModel model.BaseChatModel, systemPrompt, input string) (string, error) {
 	messages := []*schema.Message{
 		schema.SystemMessage(systemPrompt),
 		schema.UserMessage("<input>\n" + input + "\n</input>"),
 	}
 	msg, err := judgeModel.Generate(ctx, messages)
 	if err != nil {
-		return false, err
+		return "", err
 	}
 
 	content := strings.ToLower(strings.TrimSpace(msg.Content))
 	content = strings.Trim(content, "\"'. \n\t")
-	switch content {
-	case judgeTokenSafe:
-		return true, nil
-	case judgeTokenAttack:
-		return false, nil
-	default:
-		return false, nil
-	}
+	return content, nil
 }
