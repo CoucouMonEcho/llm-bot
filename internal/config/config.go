@@ -75,7 +75,7 @@ type Memory struct {
 //
 // 决策面只剩"群冷却 + 时间窗 + Redis 开关"三件事；好感度排行 / 白名单 /
 // 日限额 / 会话冷却 / 用户活跃时间窗等参数都已删除：群冷却阈值本身就是
-// 频率约束，"群里 1h 没人说话才主动开口"在直觉上也容易解释。
+// 频率约束，"bot 在群里 90min 没说话才主动开口"在直觉上也容易解释。
 //
 // 这里的时间字段保留为秒数，是为了让配置文件易读；对外统一通过方法转成
 // time.Duration，避免调用方散落重复换算。
@@ -342,8 +342,8 @@ func defaultProactive() Proactive {
 		WindowStart:            "10:00",
 		WindowEnd:              "01:00",
 		IntervalSec:            int((10 * time.Minute) / time.Second),
-		JitterMaxSec:           int((1 * time.Minute) / time.Second),
-		BotSilenceThresholdSec: int((1 * time.Hour) / time.Second),
+		JitterMaxSec:           int((45 * time.Minute) / time.Second),
+		BotSilenceThresholdSec: int((90 * time.Minute) / time.Second),
 	}
 }
 

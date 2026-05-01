@@ -84,6 +84,6 @@ proactive:
   prompt_file: "configs/prompts/persona/generator.md"
   window_start: "10:00"
   window_end: "01:00"
-  interval_sec: 300         # 每轮等待 5 分钟
-  jitter_max_sec: 60        # 抖动上限 1 分钟
-  bot_silence_threshold_sec: 3600  # bot 在群里沉默 1h 才主动开口
+  interval_sec: 300                # 每轮等待 5 分钟
+  jitter_max_sec: 3000             # 抖动上限 45 分钟
+  bot_silence_threshold_sec: 6000  # bot 在群里沉默 90min 才主动开口

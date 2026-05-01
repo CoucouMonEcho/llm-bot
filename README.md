@@ -10,7 +10,7 @@
 - **长期记忆**：按 "平台+用户" 保存压缩事实摘要；回复后异步合并更新，与短期对话历史分离。
 - **群聊触发策略**：普通群文本也会进入 `Bot`；`Bot` 只在 @ / 前缀等显式触发，或短时间连续对话窗口内，把消息送进 Agent Graph。
 - **群聊短期上下文**：未触发 Graph 的普通群文本被 `Bot` 写入一条 Redis List（`LPUSH+LTRIM+EXPIRE`，单群最多 20 条 / 10 分钟）；下次 @bot 时由 `loadContext` 直读全量并渲染成 system prompt 里的"刚才群里在聊什么"块，不进个人 history、不污染 stats / memory。
-- **主动发消息**（默认关闭）：扫一遍"bot 群内最后发言时间"HASH，挑出 bot 沉默超过 1h 的群发条短消息；发送成功后写入群历史，时间窗与 Redis 总开关收口在调度器。
+- **主动发消息**（默认关闭）：扫一遍"bot 群内最后发言时间"HASH，挑出 bot 沉默超过 90min 的群发条短消息；发送成功后写入群历史，时间窗与 Redis 总开关收口在调度器。
 - **OpenAI 兼容**：主模型与 judge 都走 OpenAI Chat Completions 协议；DeepSeek、Qwen 兼容模式、OneAPI、Ollama 都能直连。
 
 软降级是通用约定：stats / memory / proactive 失败只打日志，永远不阻断对话主链。
@@ -167,7 +167,7 @@ export LLMBOT_SERVER_ACCESS_TOKEN="..."
 
 - 调度器按**单进程**设计，没有分布式锁。多实例部署时应只让一个实例跑 `Scheduler`，或在外部补互斥。
 - 主动消息只有一个开关：Redis `bot_proactive_enabled`。默认 unset 等价于关闭；要启用 `redis-cli SET bot_proactive_enabled true`。
-- 主动消息只面向群聊，bot 沉默阈值在 `proactive.bot_silence_threshold_sec`（默认 1h）；私聊不在覆盖范围内。
+- 主动消息只面向群聊，bot 沉默阈值在 `proactive.bot_silence_threshold_sec`（默认 90min，抖动 ±45min）；私聊不在覆盖范围内。
 
 ## License
 
