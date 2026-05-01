@@ -97,7 +97,7 @@ type Scheduler struct {
 func NewScheduler(opts Options) *Scheduler {
 	cfg := opts.Config
 	if cfg.Interval <= 0 {
-		cfg.Interval = 10 * time.Minute
+		cfg.Interval = 1 * time.Minute
 	}
 	return &Scheduler{
 		state:         opts.State,
