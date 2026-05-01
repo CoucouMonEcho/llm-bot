@@ -19,14 +19,14 @@ redis:
 llm:
   base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
   api_key:  ""               # 生产环境用环境变量覆盖：LLMBOT_LLM_API_KEY
-  model:    "qwen3.6-plus"
+  model:    "deepseek-v4-flash"
   timeout_sec: 30
 
 # 提示词注入裁判模型（独立于主模型，选小而便宜的）
 judge:
   base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
   api_key:  ""
-  model:    "qwen-turbo"
+  model:    "qwen-flash"
   timeout_sec: 10
 
 # Agent 业务参数
