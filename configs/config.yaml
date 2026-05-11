@@ -85,5 +85,5 @@ proactive:
   window_start: "10:00"
   window_end: "01:00"
   interval_sec: 300                # 每轮等待 5 分钟
-  jitter_max_sec: 3000             # 抖动上限 45 分钟
-  bot_silence_threshold_sec: 6000  # bot 在群里沉默 90min 才主动开口
+  jitter_max_sec: 3000             # 抖动上限 50 分钟
+  bot_silence_threshold_sec: 6000  # bot 在群里沉默 100min 才主动开口

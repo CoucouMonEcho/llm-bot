@@ -32,7 +32,8 @@ type GroupBufferEntry struct {
 
 // GroupBufferRepo 抽象短期群聊上下文缓存的读写。
 //
-// 写入由 onebot 适配器在收到群聊消息时调用；读取由 Agent 层 loadContext
+// 写入由 Bot 层在 follow-up gate 决定"不进 Graph"的群聊普通消息分支调用
+// （见 internal/app/bot.cacheGroupBackground）；读取由 Agent 层 loadContext
 // 节点调用，渲染成系统提示词中的"群聊背景"块。规模管控（最多保留多少条 /
 // TTL）由实现侧负责（LTRIM + EXPIRE），消费者不需要关心。
 type GroupBufferRepo interface {

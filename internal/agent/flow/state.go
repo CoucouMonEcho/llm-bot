@@ -1,10 +1,10 @@
 // Package flow 定义 Agent Graph 内部流转的共享类型。
 //
 // 独立成包的理由：
-//   - agent 顶层会导入 guard 与 nodes 来装配 Graph；
-//   - guard 与 nodes 需要共享 Input / State / VerdictKind 定义；
-//   - 若把这些类型放在 agent 顶层，guard / nodes 导入 agent 会形成循环；
-//   - 因此提取为一个"叶子包"，agent / guard / nodes 都单向依赖 flow。
+//   - agent 顶层导入 nodes 装配 Graph（judgeGate 等节点都在 nodes 包里）；
+//   - nodes 需要 Input / State / VerdictKind 才能写出 Lambda 节点签名；
+//   - 若把这些类型放在 agent 顶层，nodes 导入 agent 会形成循环；
+//   - 因此提取为一个"叶子包"，agent / nodes 都单向依赖 flow。
 //
 // 本包仅保存**类型定义**，不放任何业务逻辑。
 package flow
