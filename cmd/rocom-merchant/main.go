@@ -76,10 +76,10 @@ func main() {
 		case round == lastPushedRound:
 			// 本轮已推过，直接等下一轮整点。
 			sleepUntilNextRound()
-		case now.Sub(roundStart(now, round)) > retryWindow:
-			// 已超出本轮 30 分钟重试窗口（典型情况：在中段时刻启动），放弃本轮。
-			log.Printf("当前时间已超出轮次 %d/4 的 %s 重试窗口，跳过", round, retryWindow)
-			sleepUntilNextRound()
+		//case now.Sub(roundStart(now, round)) > retryWindow:
+		//	// 已超出本轮 30 分钟重试窗口（典型情况：在中段时刻启动），放弃本轮。
+		//	log.Printf("当前时间已超出轮次 %d/4 的 %s 重试窗口，跳过", round, retryWindow)
+		//	sleepUntilNextRound()
 		default:
 			// 在重试窗口内：尝试一次拉取并推送。
 			if runOnce(round) {
