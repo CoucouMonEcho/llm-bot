@@ -36,7 +36,7 @@ const (
 	// apiKey 是 wegame.shallow.ink 接口的 X-API-Key 凭证；自行填入。
 	apiKey = "sk-ba042e079cf9ccb30e72b3d5af458f45"
 	// napcatBase 是本地 NapCatQQ HTTP API 的基地址；本地部署无需鉴权。
-	napcatBase = "http://127.0.0.1:6099"
+	napcatBase = "http://127.0.0.1:3000"
 
 	httpTimeout = 15 * time.Second
 
