@@ -10,7 +10,7 @@
 //  7. 构造 Agent Runnable（这一步会构造主/裁判 ChatModel、编译 Graph）；
 //  8. 构造 OneBot Adapter；
 //  9. 构造主动消息资源（始终构造，运行期由 Redis 开关控制）；
-//  10. 启动主动调度并把 Bot 主循环跑起来；
+//  10. 启动主动调度、远行商人后台任务，并把 Bot 主循环跑起来；
 //  11. 监听 SIGINT/SIGTERM 做优雅关闭。
 package main
 
@@ -33,6 +33,7 @@ import (
 	"github.com/echo/llm-bot/internal/memory"
 	"github.com/echo/llm-bot/internal/platform/adapter/onebot"
 	"github.com/echo/llm-bot/internal/proactive"
+	"github.com/echo/llm-bot/internal/rocom"
 	"github.com/echo/llm-bot/internal/stats"
 	"github.com/redis/go-redis/v9"
 )
@@ -156,9 +157,10 @@ func main() {
 		fatal("%v", err)
 	}
 
-	// 步骤 10：启动主动调度并跑主循环。
-	// 主动调度与主循环共享同一个 ctx：进程收到退出信号时两条链路一起停。
+	// 步骤 10：启动后台调度并跑主循环。
+	// 主动调度、远行商人任务与主循环共享同一个 ctx：进程收到退出信号时一起停。
 	go proactiveScheduler.Run(ctx)
+	go rocom.Run(ctx, ad, logger)
 	b.Run(ctx) // 阻塞直到 ctx 被取消
 
 	// 步骤 11：优雅关闭。

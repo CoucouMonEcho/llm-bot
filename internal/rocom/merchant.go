@@ -1,4 +1,3 @@
-// Command rocom-merchant 独立工具：
 // 定时拉取洛克王国"远行商人"接口、过滤本轮限时新商品、推送到 NapCat HTTP API。
 //
 // 设计为完全独立：
@@ -11,56 +10,69 @@
 //
 //	8:00 / 12:00 / 16:00 / 20:00 整点进入 30 分钟重试窗口；
 //	每 60 秒拉一次接口，命中本轮限时新商品后推送并跳出，否则窗口耗尽放弃本轮。
-package main
+package rocom
 
 import (
-	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/echo/llm-bot/internal/domain"
 	"gopkg.in/yaml.v3"
 )
-
-// ---------- 顶部硬编码区 ----------
 
 const (
 	// apiURL 是远行商人接口；refresh=true 强制取最新库存。
 	apiURL = "https://wegame.shallow.ink/api/v1/games/rocom/merchant/info?refresh=true"
-	// apiKey 是 wegame.shallow.ink 接口的 X-API-Key 凭证；自行填入。
+	// apiKey 是 wegame.shallow.ink 接口的 X-API-Key 凭证。
 	apiKey = "sk-ba042e079cf9ccb30e72b3d5af458f45"
-	// napcatBase 是本地 NapCatQQ HTTP API 的基地址；本地部署无需鉴权。
-	napcatBase = "http://127.0.0.1:3000"
 
 	httpTimeout = 15 * time.Second
+	sendTimeout = 15 * time.Second
 
 	// 整点开始后，每 retryInterval 拉一次接口，最多持续 retryWindow，
 	// 命中本轮新商品立即推送并停止；耗尽窗口则放弃本轮。
 	retryInterval = 60 * time.Second
 	retryWindow   = 30 * time.Minute
 
-	settingsName = "settings.yaml"
+	settingsName = "rocom.yaml"
 )
 
 var httpClient = &http.Client{Timeout: httpTimeout}
 
-// ---------- 主循环 ----------
+// Sender 是本任务依赖的最小发送接口；onebot.Adapter 天然满足它。
+type Sender interface {
+	Send(ctx context.Context, out *domain.OutboundMessage) error
+}
 
-func main() {
-	log.SetFlags(log.LstdFlags)
-	log.Println("rocom-merchant 启动")
+// Run 启动远行商人后台轮询任务，直到 ctx 取消。
+func Run(ctx context.Context, sender Sender, logger *slog.Logger) {
+	if sender == nil {
+		return
+	}
+	if logger == nil {
+		logger = slog.Default()
+	}
+	log := logger.With(slog.String("component", "rocom"))
+	log.Info("rocom merchant started")
 
 	// lastPushedRound 记录进程内最近一次已成功推送的轮次（1~4）；
 	// 仅用于在同一轮次的重试循环中标记"已完成"，进程重启即清零。
 	var lastPushedRound int
 
 	for {
+		if ctx.Err() != nil {
+			log.Info("rocom merchant stopped")
+			return
+		}
+
 		now := time.Now()
 		// 一天分四个轮次：8~12 → 1，12~16 → 2，16~20 → 3，20~24 → 4；其余为 0。
 		h := now.Hour()
@@ -72,34 +84,61 @@ func main() {
 		switch {
 		case round == 0:
 			// 非活动时段（0~8 点）。
-			sleepUntilNextRound()
+			if !sleepUntilNextRound(ctx, log) {
+				return
+			}
 		case round == lastPushedRound:
 			// 本轮已推过，直接等下一轮整点。
-			sleepUntilNextRound()
-		//case now.Sub(roundStart(now, round)) > retryWindow:
-		//	// 已超出本轮 30 分钟重试窗口（典型情况：在中段时刻启动），放弃本轮。
-		//	log.Printf("当前时间已超出轮次 %d/4 的 %s 重试窗口，跳过", round, retryWindow)
-		//	sleepUntilNextRound()
+			if !sleepUntilNextRound(ctx, log) {
+				return
+			}
+		// TODO: 暂时不启用 retryWindow 截断，保留重启后方便测试的行为。
+		// case now.Sub(roundStart(now, round)) > retryWindow:
+		// 	// 已超出本轮 30 分钟重试窗口（典型情况：在中段时刻启动），放弃本轮。
+		// 	log.Info("rocom merchant retry window exceeded",
+		// 		slog.Int("round", round),
+		// 		slog.Duration("retry_window", retryWindow))
+		// 	if !sleepUntilNextRound(ctx, log) {
+		// 		return
+		// 	}
 		default:
 			// 在重试窗口内：尝试一次拉取并推送。
-			if runOnce(round) {
-				log.Printf("轮次 %d/4 推送完成", round)
+			if runOnce(ctx, sender, log, round) {
+				log.Info("rocom merchant round pushed", slog.Int("round", round))
 				lastPushedRound = round
-				sleepUntilNextRound()
-			} else {
-				time.Sleep(retryInterval)
+				if !sleepUntilNextRound(ctx, log) {
+					return
+				}
+			} else if !sleep(ctx, retryInterval) {
+				return
 			}
 		}
 	}
 }
 
 // sleepUntilNextRound 计算到下一个 8/12/16/20 整点的距离并休眠。
-func sleepUntilNextRound() {
+func sleepUntilNextRound(ctx context.Context, log *slog.Logger) bool {
 	next, round := nextRoundStart(time.Now())
 	d := time.Until(next)
-	log.Printf("休眠到下一轮 %d/4 开始：%s（约 %s 后）",
-		round, next.Format("2006-01-02 15:04:05"), d.Truncate(time.Second))
-	time.Sleep(d)
+	log.Info("rocom merchant sleeping until next round",
+		slog.Int("round", round),
+		slog.String("next", next.Format("2006-01-02 15:04:05")),
+		slog.Duration("after", d.Truncate(time.Second)))
+	return sleep(ctx, d)
+}
+
+func sleep(ctx context.Context, d time.Duration) bool {
+	if d <= 0 {
+		return true
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
 }
 
 // runOnce 跑一次"拉接口 → 过滤 → 推送"链路。
@@ -107,22 +146,24 @@ func sleepUntilNextRound() {
 // 返回 true 表示本轮已发现限时新商品并执行了推送（不论各目标单点成败），
 // 调用方据此标记本轮完成、跳到下一轮等待；
 // 返回 false 表示接口失败或未发现新商品，调用方应稍后重试。
-func runOnce(round int) bool {
-	data, err := fetchMerchant()
+func runOnce(ctx context.Context, sender Sender, log *slog.Logger, round int) bool {
+	data, err := fetchMerchant(ctx)
 	if err != nil {
-		log.Printf("API 拉取失败：%v", err)
+		log.Warn("rocom merchant api fetch failed", slog.Any("err", err))
 		return false
 	}
 	now := time.Now()
 	props := freshProps(data, round, now)
 	if len(props) == 0 {
-		log.Printf("接口正常，但未发现轮次 %d/4 的限时新商品", round)
+		log.Info("rocom merchant no fresh props", slog.Int("round", round))
 		return false
 	}
 	names := propNames(props)
-	log.Printf("发现轮次 %d/4 限时新商品：%s", round, strings.Join(names, "、"))
+	log.Info("rocom merchant fresh props found",
+		slog.Int("round", round),
+		slog.String("props", strings.Join(names, "、")))
 
-	pushAll(fmt.Sprintf("远行商人上新！\n商品：%s\n检测时间：%s",
+	pushAll(ctx, sender, log, fmt.Sprintf("远行商人上新！\n商品：%s\n检测时间：%s",
 		strings.Join(names, "、"),
 		now.Format("2006-01-02 15:04:05"),
 	))
@@ -176,8 +217,8 @@ type apiProp struct {
 }
 
 // fetchMerchant 调一次远行商人接口并校验返回；失败时附带可读错误。
-func fetchMerchant() (apiData, error) {
-	req, err := http.NewRequest(http.MethodGet, apiURL, nil)
+func fetchMerchant(ctx context.Context) (apiData, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
 	if err != nil {
 		return apiData{}, err
 	}
@@ -281,62 +322,50 @@ func propNames(props []apiProp) []string {
 	return out
 }
 
-// ---------- 推送：NapCat HTTP API ----------
+// ---------- 推送：复用 OneBot 反向 WebSocket ----------
 
 // pushAll 把文案推送给 settings.yaml 中所有目标。
 //
 // 每次发送前都重读 settings.yaml，修改 yaml 即时生效，无需重启进程。
 // 单个目标失败仅记日志、不影响其他目标。
-func pushAll(text string) {
+func pushAll(ctx context.Context, sender Sender, log *slog.Logger, text string) {
 	s, err := loadSettings()
 	if err != nil {
-		log.Printf("加载 settings.yaml 失败：%v；本轮不推送", err)
+		log.Warn("rocom merchant settings load failed", slog.Any("err", err))
 		return
 	}
 	if len(s.Groups) == 0 && len(s.Privates) == 0 {
-		log.Printf("settings.yaml 中 groups/privates 都为空，本轮不推送")
+		log.Info("rocom merchant settings has no targets")
 		return
 	}
 	for _, gid := range s.Groups {
-		napcatPost(fmt.Sprintf("群 %d", gid), "/send_group_msg",
-			map[string]any{"group_id": gid, "message": text})
+		pushOne(ctx, sender, log, fmt.Sprintf("群 %d", gid), &domain.OutboundMessage{
+			Platform:  domain.PlatformOneBot,
+			ConvType:  domain.ConversationGroup,
+			SessionID: fmt.Sprintf("group_%d", gid),
+			Text:      text,
+		})
 	}
 	for _, uid := range s.Privates {
-		napcatPost(fmt.Sprintf("私聊 %d", uid), "/send_private_msg",
-			map[string]any{"user_id": uid, "message": text})
+		pushOne(ctx, sender, log, fmt.Sprintf("私聊 %d", uid), &domain.OutboundMessage{
+			Platform:  domain.PlatformOneBot,
+			ConvType:  domain.ConversationPrivate,
+			SessionID: fmt.Sprintf("private_%d", uid),
+			Text:      text,
+		})
 	}
 }
 
-// napcatPost 向 NapCat 发起一次 action 请求；成功失败都只走日志，不向上返回 error。
-func napcatPost(target, path string, payload map[string]any) {
-	body, err := json.Marshal(payload)
-	if err != nil {
-		log.Printf("推送 %s 失败（编码 payload）：%v", target, err)
+func pushOne(ctx context.Context, sender Sender, log *slog.Logger, target string, out *domain.OutboundMessage) {
+	sendCtx, cancel := context.WithTimeout(ctx, sendTimeout)
+	defer cancel()
+	if err := sender.Send(sendCtx, out); err != nil {
+		log.Warn("rocom merchant push failed",
+			slog.String("target", target),
+			slog.Any("err", err))
 		return
 	}
-	req, err := http.NewRequest(http.MethodPost, napcatBase+path, bytes.NewReader(body))
-	if err != nil {
-		log.Printf("推送 %s 失败（构造请求）：%v", target, err)
-		return
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		log.Printf("推送 %s 失败（发送请求）：%v", target, err)
-		return
-	}
-	defer func() {
-		_ = resp.Body.Close()
-	}()
-
-	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
-		log.Printf("推送 %s 失败（status %d）：%s",
-			target, resp.StatusCode, truncate(string(respBody), 200))
-		return
-	}
-	log.Printf("推送 %s 成功", target)
+	log.Info("rocom merchant push succeeded", slog.String("target", target))
 }
 
 // ---------- settings.yaml ----------
@@ -351,8 +380,8 @@ type settings struct {
 //
 // 候选路径按优先级：
 //  1. 可执行文件同级目录（go build 后部署最常见）；
-//  2. 当前工作目录（直接 ./rocom-merchant 启动时）；
-//  3. 仓库内 cmd/rocom-merchant/（go run ./cmd/rocom-merchant 时友好）。
+//  2. 当前工作目录（直接 ./llm-bot 启动时）；
+//  3. 仓库内 cmd/rocom-merchant/（go run ./cmd/llm-bot 时友好）。
 //
 // 命中第一个能读到的路径即返回；全部都不存在时返回 not found 错误。
 func loadSettings() (settings, error) {
@@ -380,7 +409,7 @@ func candidateSettingsPaths() []string {
 		paths = append(paths, filepath.Join(filepath.Dir(exe), settingsName))
 	}
 	paths = append(paths, settingsName)
-	paths = append(paths, filepath.Join("cmd", "rocom-merchant", settingsName))
+	paths = append(paths, filepath.Join("configs", settingsName))
 	return paths
 }
 
