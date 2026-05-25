@@ -1,9 +1,9 @@
-// 定时拉取洛克王国"远行商人"接口、过滤本轮限时新商品、推送到 NapCat HTTP API。
+// 定时拉取洛克王国"远行商人"接口、过滤本轮限时新商品，通过共享 OneBot Adapter 推送。
 //
-// 设计为完全独立：
-//   - 不 import 本仓库 internal/* 任何包；
-//   - 接口、凭证、NapCat 地址硬编码在文件顶部，调参只看一处；
-//   - 推送目标存放在同级目录 settings.yaml，每次发送前热读，运行中改 yaml 立即生效；
+// 设计为 llm-bot 内部后台任务：
+//   - 复用 llm-bot 已建立的 OneBot 反向 WebSocket，不单独连接 NapCat；
+//   - 远行商人接口与凭证硬编码在文件顶部，调参只看一处；
+//   - 推送目标存放在同级目录 rocom.yaml，每次发送前热读，运行中改 yaml 立即生效；
 //   - 状态全内存（仅记录"本轮已推过"），进程重启即丢失，同一轮次有可能被重复推送一次。
 //
 // 调度策略：
@@ -143,9 +143,9 @@ func sleep(ctx context.Context, d time.Duration) bool {
 
 // runOnce 跑一次"拉接口 → 过滤 → 推送"链路。
 //
-// 返回 true 表示本轮已发现限时新商品并执行了推送（不论各目标单点成败），
-// 调用方据此标记本轮完成、跳到下一轮等待；
-// 返回 false 表示接口失败或未发现新商品，调用方应稍后重试。
+// 返回 true 表示本轮已发现限时新商品，且至少一个目标推送成功；
+// 调用方据此标记本轮完成、跳到下一轮等待。
+// 返回 false 表示接口失败、未发现新商品或没有目标推送成功，调用方应稍后重试。
 func runOnce(ctx context.Context, sender Sender, log *slog.Logger, round int) bool {
 	data, err := fetchMerchant(ctx)
 	if err != nil {
@@ -163,11 +163,10 @@ func runOnce(ctx context.Context, sender Sender, log *slog.Logger, round int) bo
 		slog.Int("round", round),
 		slog.String("props", strings.Join(names, "、")))
 
-	pushAll(ctx, sender, log, fmt.Sprintf("远行商人上新！\n商品：%s\n检测时间：%s",
+	return pushAll(ctx, sender, log, fmt.Sprintf("远行商人上新！\n商品：%s\n检测时间：%s",
 		strings.Join(names, "、"),
 		now.Format("2006-01-02 15:04:05"),
 	))
-	return true
 }
 
 // ---------- 调度：轮次时间计算 ----------
@@ -324,59 +323,66 @@ func propNames(props []apiProp) []string {
 
 // ---------- 推送：复用 OneBot 反向 WebSocket ----------
 
-// pushAll 把文案推送给 settings.yaml 中所有目标。
+// pushAll 把文案推送给 rocom.yaml 中所有目标。
 //
-// 每次发送前都重读 settings.yaml，修改 yaml 即时生效，无需重启进程。
-// 单个目标失败仅记日志、不影响其他目标。
-func pushAll(ctx context.Context, sender Sender, log *slog.Logger, text string) {
+// 每次发送前都重读 rocom.yaml，修改 yaml 即时生效，无需重启进程。
+// 单个目标失败仅记日志、不影响其他目标；至少一个目标发送成功时返回 true。
+func pushAll(ctx context.Context, sender Sender, log *slog.Logger, text string) bool {
 	s, err := loadSettings()
 	if err != nil {
 		log.Warn("rocom merchant settings load failed", slog.Any("err", err))
-		return
+		return false
 	}
 	if len(s.Groups) == 0 && len(s.Privates) == 0 {
 		log.Info("rocom merchant settings has no targets")
-		return
+		return false
 	}
+	var sent bool
 	for _, gid := range s.Groups {
-		pushOne(ctx, sender, log, fmt.Sprintf("群 %d", gid), &domain.OutboundMessage{
+		if pushOne(ctx, sender, log, fmt.Sprintf("群 %d", gid), &domain.OutboundMessage{
 			Platform:  domain.PlatformOneBot,
 			ConvType:  domain.ConversationGroup,
 			SessionID: fmt.Sprintf("group_%d", gid),
 			Text:      text,
-		})
+		}) {
+			sent = true
+		}
 	}
 	for _, uid := range s.Privates {
-		pushOne(ctx, sender, log, fmt.Sprintf("私聊 %d", uid), &domain.OutboundMessage{
+		if pushOne(ctx, sender, log, fmt.Sprintf("私聊 %d", uid), &domain.OutboundMessage{
 			Platform:  domain.PlatformOneBot,
 			ConvType:  domain.ConversationPrivate,
 			SessionID: fmt.Sprintf("private_%d", uid),
 			Text:      text,
-		})
+		}) {
+			sent = true
+		}
 	}
+	return sent
 }
 
-func pushOne(ctx context.Context, sender Sender, log *slog.Logger, target string, out *domain.OutboundMessage) {
+func pushOne(ctx context.Context, sender Sender, log *slog.Logger, target string, out *domain.OutboundMessage) bool {
 	sendCtx, cancel := context.WithTimeout(ctx, sendTimeout)
 	defer cancel()
 	if err := sender.Send(sendCtx, out); err != nil {
 		log.Warn("rocom merchant push failed",
 			slog.String("target", target),
 			slog.Any("err", err))
-		return
+		return false
 	}
 	log.Info("rocom merchant push succeeded", slog.String("target", target))
+	return true
 }
 
-// ---------- settings.yaml ----------
+// ---------- rocom.yaml ----------
 
-// settings 是 settings.yaml 的结构；两个字段都允许缺省。
+// settings 是 rocom.yaml 的结构；两个字段都允许缺省。
 type settings struct {
 	Groups   []int64 `yaml:"groups"`
 	Privates []int64 `yaml:"privates"`
 }
 
-// loadSettings 每次发送前都重读 settings.yaml，使运行中修改即时生效。
+// loadSettings 每次发送前都重读 rocom.yaml，使运行中修改即时生效。
 //
 // 候选路径按优先级：
 //  1. 可执行文件同级目录（go build 后部署最常见）；
@@ -400,7 +406,7 @@ func loadSettings() (settings, error) {
 		}
 		lastErr = err
 	}
-	return settings{}, fmt.Errorf("settings.yaml not found: %v", lastErr)
+	return settings{}, fmt.Errorf("%s not found: %v", settingsName, lastErr)
 }
 
 func candidateSettingsPaths() []string {
