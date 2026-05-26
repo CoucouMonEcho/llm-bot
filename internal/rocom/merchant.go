@@ -38,9 +38,8 @@ const (
 	sendTimeout = 15 * time.Second
 
 	// 整点开始后，每 retryInterval 拉一次接口，最多持续 retryWindow，
-	// 命中本轮新商品立即推送并停止；耗尽窗口则放弃本轮。
+	// 命中本轮新商品立即推送并停止。
 	retryInterval = 60 * time.Second
-	retryWindow   = 30 * time.Minute
 
 	settingsName = "rocom.yaml"
 )
@@ -92,15 +91,7 @@ func Run(ctx context.Context, sender Sender, logger *slog.Logger) {
 			if !sleepUntilNextRound(ctx, log) {
 				return
 			}
-		// TODO: 暂时不启用 retryWindow 截断，保留重启后方便测试的行为。
-		// case now.Sub(roundStart(now, round)) > retryWindow:
-		// 	// 已超出本轮 30 分钟重试窗口（典型情况：在中段时刻启动），放弃本轮。
-		// 	log.Info("rocom merchant retry window exceeded",
-		// 		slog.Int("round", round),
-		// 		slog.Duration("retry_window", retryWindow))
-		// 	if !sleepUntilNextRound(ctx, log) {
-		// 		return
-		// 	}
+		// 不启用 retryWindow 截断，重启后方便测试
 		default:
 			// 在重试窗口内：尝试一次拉取并推送。
 			if runOnce(ctx, sender, log, round) {
