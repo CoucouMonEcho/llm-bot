@@ -41,9 +41,18 @@ func NewChatModel(ctx context.Context, cfg config.LLM) (model.BaseChatModel, err
 		APIKey:     cfg.APIKey,
 		Model:      cfg.Model,
 		HTTPClient: httpClient,
-		// 关闭"思考模式"。
+		// 关闭"思考模式"。不同 OpenAI 兼容服务读取的位置不同：
+		// DeepSeek V4 读顶层 thinking，DashScope/部分代理读顶层
+		// enable_thinking，vLLM/Qwen chat template 读
+		// chat_template_kwargs.enable_thinking。
 		ExtraFields: map[string]any{
+			"thinking": map[string]any{
+				"type": "disabled",
+			},
 			"enable_thinking": false,
+			"chat_template_kwargs": map[string]any{
+				"enable_thinking": false,
+			},
 		},
 	})
 	if err != nil {
