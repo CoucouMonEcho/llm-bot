@@ -154,9 +154,8 @@ func runOnce(ctx context.Context, sender Sender, log *slog.Logger, round int) bo
 		slog.Int("round", round),
 		slog.String("props", strings.Join(names, "、")))
 
-	return pushAll(ctx, sender, log, fmt.Sprintf("远行商人上新！\n商品：%s\n检测时间：%s",
+	return pushAll(ctx, sender, log, fmt.Sprintf("远行商人推送通知：%s",
 		strings.Join(names, "、"),
-		now.Format("2006-01-02 15:04:05"),
 	))
 }
 
