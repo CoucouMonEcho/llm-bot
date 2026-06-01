@@ -32,7 +32,7 @@ const (
 	// apiURL 是远行商人接口；refresh=true 强制取最新库存。
 	apiURL = "https://wegame.shallow.ink/api/v1/games/rocom/merchant/info?refresh=true"
 	// apiKey 是 wegame.shallow.ink 接口的 X-API-Key 凭证。
-	apiKey = "sk-ba042e079cf9ccb30e72b3d5af458f45"
+	apiKey = "sk-f9a97f99fed455ae910d028edc172078"
 
 	httpTimeout = 15 * time.Second
 	sendTimeout = 15 * time.Second
